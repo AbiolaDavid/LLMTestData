@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+sentence-transformers
+weaviate-client
+pypdf
+langchain-text-splitters
+python-dotenv
+numpy
