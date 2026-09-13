@@ -9,13 +9,13 @@ services:
     healthCheckPath: /healthz
     autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.0"          # <-- CHANGE FROM 3.14 TO 3.13 OR 3.12
       - key: WEAVIATE_URL
-        sync: false           # set in Render dashboard
+        sync: false
       - key: WEAVIATE_API_KEY
         sync: false
       - key: WEAVIATE_COLLECTION
         value: TestingData
       - key: ALLOWED_ORIGINS
-        value: "*"            # tighten later
-      - key: PYTHON_VERSION
-        value: "3.13.0"
+        value: "*"
