@@ -6,3 +6,5 @@ pypdf
 langchain-text-splitters
 python-dotenv
 numpy
+pydantic>=2
+weaviate-agents
