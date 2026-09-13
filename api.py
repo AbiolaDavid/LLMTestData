@@ -1,16 +1,14 @@
 import os
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from weaviate_client import client  # your Weaviate connection
+from weaviate_client import get_client, get_agent   # <-- changed
 
 app = FastAPI()
 
-# ---------- CORS ----------
-# Replace "*" with your frontend URL once it's deployed:
-# e.g. ["https://myapp.vercel.app", "http://localhost:5173"]
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,40 +18,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Models ----------
 class Question(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=2000)
+    collection: Optional[str] = None
+
+class Source(BaseModel):
+    text: str = ""
+    source: Optional[str] = None
+    page: Optional[int] = None
+    chunk_id: Optional[str] = None
 
 class Answer(BaseModel):
     answer: str
+    sources: List[Source] = []
 
-# ---------- Routes ----------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "testingdata-llm"}
+    try:
+        ready = get_client().is_ready()
+    except Exception:
+        ready = False
+    return {"status": "ok", "service": "testingdata-llm", "weaviate_ready": ready}
 
 @app.post("/ask", response_model=Answer)
 def ask_question(data: Question):
     try:
-        collection = client.collections.get("TestingData")  # <-- change me
+        agent = get_agent(data.collection)
+        resp = agent.ask(data.question)
 
-        results = collection.query.near_text(
-            query=data.question,
-            limit=3,
-        )
+        answer = getattr(resp, "final_answer", None) or str(resp)
 
-        if not results.objects:
-            return {"answer": "I couldn't find anything relevant."}
+        sources: List[Source] = []
+        for s in getattr(resp, "sources", None) or []:
+            if isinstance(s, dict):
+                sources.append(Source(**{k: s.get(k) for k in ("text","source","page","chunk_id")}))
+            else:
+                sources.append(Source(
+                    text=getattr(s, "text", "") or "",
+                    source=getattr(s, "source", None),
+                    page=getattr(s, "page", None),
+                    chunk_id=getattr(s, "chunk_id", None),
+                ))
 
-        # Combine the top matches into one answer.
-        # Adjust based on your schema: obj.properties.get("text") or similar.
-        snippets = [
-            obj.properties.get("text", "source", "page", "chunk_id")
-            for obj in results.objects
-        ]
-        answer = "\n\n".join(s for s in snippets if s)
-
-        return {"answer": answer or "No content found."}
+        return Answer(answer=answer, sources=sources)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Weaviate error: {e}")
+        raise HTTPException(status_code=500, detail=f"QueryAgent error: {e}")
