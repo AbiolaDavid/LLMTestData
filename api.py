@@ -21,16 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Advanced Prompt: Strict but Comprehension-Aware ----------
-# This allows the LLM to synthesize information, but forbids outside knowledge.
-STRICT_RAG_INSTRUCTIONS = """You are a precise research assistant. 
-Answer the user's question using ONLY the provided context.
-Rules:
-1. Read the context carefully. You are allowed to synthesize and summarize information that is clearly supported by the text.
-2. DO NOT use your pre-trained knowledge or outside facts.
-3. If the context truly does not contain the answer, respond EXACTLY with: "I do not have enough information in the provided documents to answer that."
-4. Do not guess or make assumptions."""
-
 # ---------- Models ----------
 class Question(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
@@ -46,22 +36,19 @@ class Answer(BaseModel):
     answer: str
     sources: List[Source] = []
 
-# ---------- Source Extraction (Catch-All & Debuggable) ----------
+# ---------- Source Extraction (Using EXACT Property Names) ----------
 def _extract_sources(resp: Any) -> List[Source]:
-    raw = (
-        getattr(resp, "sources", None)
-        or getattr(resp, "objects", None)
-        or getattr(resp, "collection_results", None)
-        or []
-    )
-    if not raw and hasattr(resp, "sources"):
-        inner = getattr(resp.sources, "objects", None)
-        if inner:
-            raw = inner
+    raw = getattr(resp, "sources", None) or []
+    
+    # DEBUG: Log the raw structure of the sources returned by Weaviate
+    log.info(f"DEBUG RAW SOURCES: type={type(raw).__name__}, length={len(raw) if hasattr(raw, '__len__') else 'N/A'}")
+    if raw and len(raw) > 0:
+        log.info(f"DEBUG FIRST SOURCE RAW: {raw[0]}")
 
     out: List[Source] = []
     for item in raw:
         try:
+            # Handle dict or object
             if isinstance(item, dict):
                 props = item.get("properties", item)
             elif hasattr(item, "properties") and item.properties is not None:
@@ -69,42 +56,31 @@ def _extract_sources(resp: Any) -> List[Source]:
             else:
                 props = item
 
-            def pick(*names, default=None):
-                for n in names:
-                    if isinstance(props, dict) and props.get(n) not in (None, ""):
-                        return props[n]
-                    v = getattr(props, n, None)
-                    if v not in (None, ""):
-                        return v
-                return default
+            # Extract using EXACT property names you confirmed
+            def get_val(key):
+                if isinstance(props, dict):
+                    return props.get(key)
+                return getattr(props, key, None)
 
-            # 1. Try standard names
-            text_val = pick("text", "content", "body", "chunk", "passage", "document", default="")
-            
-            # 2. CATCH-ALL: If standard names fail, find the FIRST long string property in the object
-            if not text_val and isinstance(props, dict):
-                for key, val in props.items():
-                    if isinstance(val, str) and len(val) > 50: # Assume long strings are the document text
-                        text_val = val
-                        break
-            
+            text_val = get_val("text")
+            source_val = get_val("source")
+            page_val = get_val("page")
+            chunk_id_val = get_val("chunk_id")
+
             src = Source(
-                text     = str(text_val or ""),
-                source   = pick("source", "filename", "title", "doc_id"),
-                page     = pick("page", "page_number", "page_num"),
-                chunk_id = pick("chunk_id", "id", "uuid"),
+                text=str(text_val or ""),
+                source=str(source_val) if source_val is not None else None,
+                page=int(page_val) if page_val is not None else None,
+                chunk_id=str(chunk_id_val) if chunk_id_val is not None else None,
             )
-            if src.text or src.source:
+            
+            if src.text:
                 out.append(src)
         except Exception as e:
-            log.warning("Failed to parse source item: %s", e)
+            log.warning(f"Failed to parse source item: {e}")
             continue
-    
-    # DEBUG LOG: This will show up in your Render logs. 
-    # If it says "Extracted 0 sources" or "Total text length: 0", your Weaviate schema names don't match.
-    total_text_len = sum(len(s.text) for s in out)
-    log.info(f"DEBUG: Extracted {len(out)} sources. Total text length passed to LLM: {total_text_len} chars.")
-    
+            
+    log.info(f"DEBUG EXTRACTED SOURCES COUNT: {len(out)}")
     return out
 
 # ---------- Routes ----------
@@ -125,26 +101,20 @@ def root():
 def ask_question(data: Question):
     try:
         agent = get_agent(data.collection)
+        resp = agent.ask(data.question)
         
-        # Try passing instructions. If the weaviate-agents version throws a TypeError, it will fall back.
-        try:
-            resp = agent.ask(data.question, instructions=STRICT_RAG_INSTRUCTIONS)
-        except TypeError:
-            log.warning("QueryAgent does not support 'instructions' kwarg in this version. Using default.")
-            resp = agent.ask(data.question)
-
-        answer = getattr(resp, "final_answer", None) or str(resp)
+        # 1. Get the raw answer directly from the LLM/Agent BEFORE any code touches it
+        raw_answer = getattr(resp, "final_answer", None) or str(resp)
+        log.info(f"DEBUG RAW LLM ANSWER: {raw_answer}")
+        
+        # 2. Extract sources using exact property names
         sources = _extract_sources(resp)
 
-        # GUARDRAIL: If extraction failed and returned 0 sources, force the fallback.
-        if not sources:
-            log.warning("CODE GUARDRAIL TRIGGERED: No sources extracted. Forcing fallback to prevent hallucination.")
-            return Answer(
-                answer="I do not have enough information in the provided documents to answer that.",
-                sources=[]
-            )
-
-        return Answer(answer=answer, sources=sources)
+        # 3. GUARDRAIL TEMPORARILY DISABLED
+        # We are returning the raw answer directly to see if the LLM was actually refusing, 
+        # or if our previous code was falsely overwriting a correct answer.
+        
+        return Answer(answer=raw_answer, sources=sources)
 
     except Exception as e:
         log.exception("QueryAgent failed")
