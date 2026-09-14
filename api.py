@@ -21,15 +21,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Advanced Prompt Engineering ----------
-# This prompt uses "Negative Constraints" and "Forced Fallbacks" to stop hallucinations.
-STRICT_RAG_INSTRUCTIONS = """You are a strict, highly accurate research assistant. 
-Your task is to answer the user's question using ONLY the provided context.
+# ---------- Advanced Prompt: Strict but Comprehension-Aware ----------
+# This allows the LLM to synthesize information, but forbids outside knowledge.
+STRICT_RAG_INSTRUCTIONS = """You are a precise research assistant. 
+Answer the user's question using ONLY the provided context.
 Rules:
-1. If the answer is not explicitly stated in the context, you MUST respond EXACTLY with: "I do not have enough information in the provided documents to answer that."
-2. Do not use your pre-trained knowledge or outside facts.
-3. Do not guess, infer, or make assumptions.
-4. Base your answer strictly on the retrieved sources."""
+1. Read the context carefully. You are allowed to synthesize and summarize information that is clearly supported by the text.
+2. DO NOT use your pre-trained knowledge or outside facts.
+3. If the context truly does not contain the answer, respond EXACTLY with: "I do not have enough information in the provided documents to answer that."
+4. Do not guess or make assumptions."""
 
 # ---------- Models ----------
 class Question(BaseModel):
@@ -46,11 +46,8 @@ class Answer(BaseModel):
     answer: str
     sources: List[Source] = []
 
-# ---------- Source Extraction (Robust) ----------
+# ---------- Source Extraction (Catch-All & Debuggable) ----------
 def _extract_sources(resp: Any) -> List[Source]:
-    """
-    Pull sources out of a QueryAgent response, tolerating multiple shapes.
-    """
     raw = (
         getattr(resp, "sources", None)
         or getattr(resp, "objects", None)
@@ -81,8 +78,18 @@ def _extract_sources(resp: Any) -> List[Source]:
                         return v
                 return default
 
+            # 1. Try standard names
+            text_val = pick("text", "content", "body", "chunk", "passage", "document", default="")
+            
+            # 2. CATCH-ALL: If standard names fail, find the FIRST long string property in the object
+            if not text_val and isinstance(props, dict):
+                for key, val in props.items():
+                    if isinstance(val, str) and len(val) > 50: # Assume long strings are the document text
+                        text_val = val
+                        break
+            
             src = Source(
-                text     = str(pick("text", "content", "body", "chunk", default="") or ""),
+                text     = str(text_val or ""),
                 source   = pick("source", "filename", "title", "doc_id"),
                 page     = pick("page", "page_number", "page_num"),
                 chunk_id = pick("chunk_id", "id", "uuid"),
@@ -92,6 +99,12 @@ def _extract_sources(resp: Any) -> List[Source]:
         except Exception as e:
             log.warning("Failed to parse source item: %s", e)
             continue
+    
+    # DEBUG LOG: This will show up in your Render logs. 
+    # If it says "Extracted 0 sources" or "Total text length: 0", your Weaviate schema names don't match.
+    total_text_len = sum(len(s.text) for s in out)
+    log.info(f"DEBUG: Extracted {len(out)} sources. Total text length passed to LLM: {total_text_len} chars.")
+    
     return out
 
 # ---------- Routes ----------
@@ -113,30 +126,23 @@ def ask_question(data: Question):
     try:
         agent = get_agent(data.collection)
         
-        # 1. Inject Strict Prompt Instructions (if supported by the agent SDK version)
+        # Try passing instructions. If the weaviate-agents version throws a TypeError, it will fall back.
         try:
             resp = agent.ask(data.question, instructions=STRICT_RAG_INSTRUCTIONS)
         except TypeError:
-            # Fallback if the specific weaviate-agents version doesn't accept 'instructions' in ask()
+            log.warning("QueryAgent does not support 'instructions' kwarg in this version. Using default.")
             resp = agent.ask(data.question)
 
         answer = getattr(resp, "final_answer", None) or str(resp)
         sources = _extract_sources(resp)
 
-        # 2. CODE-LEVEL GUARDRAIL: The "Empty Context" Override
-        # If the agent found 0 relevant sources, the LLM is likely hallucinating.
-        # We override the answer to enforce the fallback.
+        # GUARDRAIL: If extraction failed and returned 0 sources, force the fallback.
         if not sources:
-            log.warning("No sources retrieved. Overriding LLM answer to prevent hallucination.")
+            log.warning("CODE GUARDRAIL TRIGGERED: No sources extracted. Forcing fallback to prevent hallucination.")
             return Answer(
                 answer="I do not have enough information in the provided documents to answer that.",
                 sources=[]
             )
-
-        # 3. Check if the LLM successfully triggered its own fallback phrase
-        fallback_phrases = ["do not have enough information", "i don't know", "not explicitly stated"]
-        if any(phrase in answer.lower() for phrase in fallback_phrases):
-            return Answer(answer=answer, sources=[]) # Return answer but clear sources if it's a fallback
 
         return Answer(answer=answer, sources=sources)
 
