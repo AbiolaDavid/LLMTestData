@@ -1,70 +1,122 @@
-import os
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from weaviate_client import (
+    get_agent,
+    search_collection,
+    close_client,
+    COLLECTION_NAME,
+)
+import os
 
-from weaviate_client import get_client, get_agent   # <-- changed
-
-app = FastAPI()
-
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+app = FastAPI(
+    title="SOC 101 RAG API",
+    description="Query the TestingData Weaviate collection (Introduction to Sociology).",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class Question(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000)
-    collection: Optional[str] = None
 
-class Source(BaseModel):
-    text: str = ""
-    source: Optional[str] = None
-    page: Optional[int] = None
-    chunk_id: Optional[str] = None
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="Natural-language question")
 
-class Answer(BaseModel):
+
+class SourceItem(BaseModel):
+    text: str | None = None
+    source: str | None = None
+    module_title: str | None = None
+    heading: str | None = None
+    page: int | None = None
+    chunk_id: str | None = None
+    score: float | None = None
+
+
+class AskResponse(BaseModel):
     answer: str
-    sources: List[Source] = []
+    sources: list[SourceItem]
+
+
+class SearchResponse(BaseModel):
+    query: str
+    collection: str
+    results: list[SourceItem]
+
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"status": "ok", "collection": COLLECTION_NAME}
 
-@app.get("/")
-def root():
+
+@app.post("/ask", response_model=AskResponse)
+def ask_question(req: AskRequest):
+    """
+    RAG endpoint: QueryAgent searches TestingData and generates an answer
+    grounded in the retrieved chunks.
+    """
     try:
-        ready = get_client().is_ready()
-    except Exception:
-        ready = False
-    return {"status": "ok", "service": "testingdata-llm", "weaviate_ready": ready}
-
-@app.post("/ask", response_model=Answer)
-def ask_question(data: Question):
-    try:
-        agent = get_agent(data.collection)
-        resp = agent.ask(data.question)
-
-        answer = getattr(resp, "final_answer", None) or str(resp)
-
-        sources: List[Source] = []
-        for s in getattr(resp, "sources", None) or []:
-            if isinstance(s, dict):
-                sources.append(Source(**{k: s.get(k) for k in ("text","source","page","chunk_id")}))
-            else:
-                sources.append(Source(
-                    text=getattr(s, "text", "") or "",
-                    source=getattr(s, "source", None),
-                    page=getattr(s, "page", None),
-                    chunk_id=getattr(s, "chunk_id", None),
-                ))
-
-        return Answer(answer=answer, sources=sources)
-
+        agent = get_agent()
+        result = agent.ask(req.question)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"QueryAgent error: {e}")
+        raise HTTPException(status_code=500, detail=f"Agent error: {e}") from e
+
+    sources: list[SourceItem] = []
+    for s in getattr(result, "sources", []) or []:
+        props = getattr(s, "properties", None) or {}
+        sources.append(
+            SourceItem(
+                text=props.get("text"),
+                source=props.get("source"),
+                module_title=props.get("module_title"),
+                heading=props.get("heading"),
+                page=props.get("page"),
+                chunk_id=props.get("chunk_id"),
+            )
+        )
+
+    answer = getattr(result, "final_answer", None) or str(result)
+    return AskResponse(answer=answer, sources=sources)
+
+
+@app.get("/search", response_model=SearchResponse)
+def search(
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(8, ge=1, le=30, description="Max number of chunks to return"),
+    alpha: float = Query(
+        0.7,
+        ge=0.0,
+        le=1.0,
+        description="Hybrid search balance (0=BM25 only, 1=vector only)",
+    ),
+):
+    """
+    Direct hybrid search against the TestingData collection.
+    Returns ranked chunks with metadata (no LLM answer generation).
+    """
+    try:
+        hits = search_collection(q, limit=limit, alpha=alpha)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search error: {e}") from e
+
+    results = [
+        SourceItem(
+            text=h.get("text"),
+            source=h.get("source"),
+            module_title=h.get("module_title"),
+            heading=h.get("heading"),
+            page=h.get("page"),
+            chunk_id=h.get("chunk_id"),
+            score=h.get("score"),
+        )
+        for h in hits
+    ]
+    return SearchResponse(query=q, collection=COLLECTION_NAME, results=results)
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    close_client()
