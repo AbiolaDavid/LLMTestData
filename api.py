@@ -7,6 +7,7 @@ from weaviate_client import (
     close_client,
     COLLECTION_NAME,
 )
+from formatter import format_answer, format_search_results, format_source
 import os
 
 app = FastAPI(
@@ -24,6 +25,7 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Natural-language question")
+    pretty: bool = Field(True, description="Return a human-readable formatted answer")
 
 
 class SourceItem(BaseModel):
@@ -34,10 +36,12 @@ class SourceItem(BaseModel):
     page: int | None = None
     chunk_id: str | None = None
     score: float | None = None
+    citation: str | None = None  # pre-formatted block (Source / Module / Page / Course Title)
 
 
 class AskResponse(BaseModel):
     answer: str
+    answer_pretty: str | None = None
     sources: list[SourceItem]
 
 
@@ -45,6 +49,7 @@ class SearchResponse(BaseModel):
     query: str
     collection: str
     results: list[SourceItem]
+    results_pretty: str | None = None
 
 
 @app.get("/healthz")
@@ -67,19 +72,28 @@ def ask_question(req: AskRequest):
     sources: list[SourceItem] = []
     for s in getattr(result, "sources", []) or []:
         props = getattr(s, "properties", None) or {}
-        sources.append(
-            SourceItem(
-                text=props.get("text"),
-                source=props.get("source"),
-                module_title=props.get("module_title"),
-                heading=props.get("heading"),
-                page=props.get("page"),
-                chunk_id=props.get("chunk_id"),
-            )
+        item = SourceItem(
+            text=props.get("text"),
+            source=props.get("source"),
+            module_title=props.get("module_title"),
+            heading=props.get("heading"),
+            page=props.get("page"),
+            chunk_id=props.get("chunk_id"),
+        )
+        item.citation = format_source(item.model_dump())
+        sources.append(item)
+
+    raw_answer = getattr(result, "final_answer", None) or str(result)
+
+    if req.pretty:
+        pretty = format_answer(raw_answer, sources, include_sources=True)
+        return AskResponse(
+            answer=pretty,
+            answer_pretty=pretty,
+            sources=sources,
         )
 
-    answer = getattr(result, "final_answer", None) or str(result)
-    return AskResponse(answer=answer, sources=sources)
+    return AskResponse(answer=raw_answer, sources=sources)
 
 
 @app.get("/search", response_model=SearchResponse)
@@ -92,6 +106,7 @@ def search(
         le=1.0,
         description="Hybrid search balance (0=BM25 only, 1=vector only)",
     ),
+    pretty: bool = Query(True, description="Also return a human-readable block"),
 ):
     """
     Direct hybrid search against the TestingData collection.
@@ -102,8 +117,9 @@ def search(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search error: {e}") from e
 
-    results = [
-        SourceItem(
+    results = []
+    for h in hits:
+        item = SourceItem(
             text=h.get("text"),
             source=h.get("source"),
             module_title=h.get("module_title"),
@@ -112,9 +128,17 @@ def search(
             chunk_id=h.get("chunk_id"),
             score=h.get("score"),
         )
-        for h in hits
-    ]
-    return SearchResponse(query=q, collection=COLLECTION_NAME, results=results)
+        item.citation = format_source(item.model_dump())
+        results.append(item)
+
+    pretty_block = format_search_results(hits) if pretty else None
+
+    return SearchResponse(
+        query=q,
+        collection=COLLECTION_NAME,
+        results=results,
+        results_pretty=pretty_block,
+    )
 
 
 @app.on_event("shutdown")
