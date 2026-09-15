@@ -25,7 +25,6 @@ def get_client() -> weaviate.WeaviateClient:
         if not url or not key:
             raise RuntimeError("WEAVIATE_URL and WEAVIATE_API_KEY must be set")
 
-        # Pass third-party keys so the collection's vectorizer can embed queries
         headers: dict[str, str] = {}
         hf = os.getenv("HUGGINGFACE_API_KEY")
         if hf:
@@ -64,10 +63,7 @@ def search_collection(
     alpha: float = 0.7,
     collection_name: str | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    Hybrid search against the collection and return plain dicts of properties
-    plus score (when available).
-    """
+    """Hybrid search against the collection; returns plain dicts + score."""
     collection = get_collection(collection_name)
     response = collection.query.hybrid(
         query=query,
@@ -98,7 +94,6 @@ def get_agent(collection_name: str | None = None) -> QueryAgent:
     global _agent, _agent_collection
     name = collection_name or COLLECTION_NAME
     if _agent is None or _agent_collection != name:
-        # Ensure the collection exists before creating the agent
         get_collection(name)
         _agent = QueryAgent(
             client=get_client(),
