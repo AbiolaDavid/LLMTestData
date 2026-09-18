@@ -1,125 +1,89 @@
 import os
-from typing import List, Optional
-from fastmcp import FastMCP, Context
-import weaviate
-
-# Assuming your existing modules are structured like this based on your stack
-# from weaviate_client import get_weaviate_client 
-# from formatter import format_search_results
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_huggingface import HuggingFaceEmbeddings
+from fastmcp import FastMCP
+from weaviate_client import (
+    get_agent,
+    search_collection,
+    get_client,
+    COLLECTION_NAME,
+)
+from formatter import format_answer, format_search_results
 
 # Initialize the FastMCP server
-# Dependencies can be passed so `fastmcp install` automatically grabs them
-mcp = FastMCP(
-    "Knowledge Retrieval Server", 
-    dependencies=["weaviate-client", "langchain-community", "langchain-huggingface", "pypdf"]
-)
+mcp = FastMCP("SOC 101 Sociology Assistant")
 
 # ---------------------------------------------------------------------------
-# 1. Weaviate & Embedding Setup (Mocked based on your previous stack)
+# 1. MCP Tools (Actions the AI client can execute)
 # ---------------------------------------------------------------------------
-def get_embeddings():
-    """Initialize HuggingFace embeddings."""
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-def get_weaviate_client():
-    """Connect to the Weaviate vector database."""
-    # Replace with your actual Weaviate cluster URL and API key
-    weaviate_url = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
-    return weaviate.Client(url=weaviate_url)
-
-# ---------------------------------------------------------------------------
-# 2. MCP Tools
-# Tools are actions the LLM can actively call with arguments.
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def search_knowledge_base(query: str, limit: int = 5) -> str:
-    """
-    Search the Weaviate vector database for relevant context based on a query.
-    
-    Args:
-        query: The search term or question to look up.
-        limit: Maximum number of results to return.
-    """
-    client = get_weaviate_client()
-    embeddings = get_embeddings()
-    
-    # Generate vector for the query
-    query_vector = embeddings.embed_query(query)
-    
-    # Execute Weaviate nearVector search (assuming a collection named "Document")
-    try:
-        response = (
-            client.query
-            .get("Document", ["text", "source"])
-            .with_near_vector({"vector": query_vector})
-            .with_limit(limit)
-            .do()
-        )
-        
-        results = response.get("data", {}).get("Get", {}).get("Document", [])
-        if not results:
-            return "No relevant documents found for your query."
-            
-        # Format results for the LLM
-        formatted_context = "\n\n".join([
-            f"Source: {res.get('source', 'Unknown')}\nContent: {res.get('text', '')}"
-            for res in results
-        ])
-        
-        return f"Found {len(results)} results:\n\n{formatted_context}"
-    except Exception as e:
-        return f"Error querying Weaviate database: {str(e)}"
 
 
 @mcp.tool()
-async def upload_pdf_to_vectorstore(file_path: str, ctx: Context) -> str:
+def ask_sociology_question(question: str) -> str:
     """
-    Ingest a PDF file, chunk it, embed it, and upload it to Weaviate.
-    
-    Args:
-        file_path: The local absolute path to the PDF file to upload.
+    Query the Introduction to Sociology course materials to answer natural-language questions.
+    Returns a grounded answer with module, heading, and page citations.
     """
-    ctx.info(f"Starting ingestion for {file_path}")
-    
-    if not os.path.exists(file_path):
-        return f"Error: File not found at {file_path}"
-        
     try:
-        # Load the document using LangChain
-        loader = PyPDFLoader(file_path)
-        pages = loader.load_and_split()
-        
-        ctx.info(f"Extracted {len(pages)} pages. Generating embeddings...")
-        
-        # In a real app, you would batch upload these to Weaviate here using your 
-        # existing weaviate_client.py logic.
-        
-        return f"Successfully processed {file_path} and uploaded {len(pages)} chunks to Weaviate."
+        agent = get_agent()
+        result = agent.ask(question)
+
+        sources = []
+        for s in getattr(result, "sources", []) or []:
+            props = getattr(s, "properties", None) or {}
+            sources.append(
+                {
+                    "heading": props.get("heading"),
+                    "module_title": props.get("module_title"),
+                    "page": props.get("page"),
+                    "source": props.get("source"),
+                    "chunk_id": props.get("chunk_id"),
+                }
+            )
+
+        raw_answer = getattr(result, "final_answer", None) or str(result)
+        return format_answer(raw_answer, sources, include_sources=True)
     except Exception as e:
-        ctx.error(f"Ingestion failed: {str(e)}")
-        return f"Failed to upload dataset: {str(e)}"
+        return f"Agent error: {e}"
+
+
+@mcp.tool()
+def search_sociology_passages(
+    query: str, limit: int = 5, alpha: float = 0.7
+) -> str:
+    """
+    Perform a direct hybrid search against the SOC 101 collection without LLM answer generation.
+    Returns ranked passages with source citations.
+    """
+    try:
+        hits = search_collection(query, limit=limit, alpha=alpha)
+        return format_search_results(hits)
+    except Exception as e:
+        return f"Search error: {e}"
+
 
 # ---------------------------------------------------------------------------
-# 3. MCP Resources
-# Resources are static or dynamic data the LLM can read via URIs.
+# 2. MCP Resources (Context the AI client can inspect)
 # ---------------------------------------------------------------------------
+
 
 @mcp.resource("system://status")
 def get_system_status() -> str:
-    """Check if the Weaviate database and embedding models are online."""
+    """Check the connection status of the Weaviate cluster and target collection."""
     try:
-        client = get_weaviate_client()
+        client = get_client()
         is_ready = client.is_ready()
-        return f"System Status: ONLINE\nWeaviate DB Ready: {is_ready}"
+        has_collection = client.collections.exists(COLLECTION_NAME)
+        return (
+            f"System Status: ONLINE\n"
+            f"Weaviate Connected: {is_ready}\n"
+            f"Target Collection ('{COLLECTION_NAME}'): {'Found' if has_collection else 'Missing'}"
+        )
     except Exception as e:
-        return f"System Status: DEGRADED\nError: {str(e)}"
+        return f"System Status: OFFLINE\nError: {e}"
+
 
 # ---------------------------------------------------------------------------
-# Server Entry Point
+# Entry Point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Runs the server using the stdio transport by default (ideal for Claude Desktop)
+    # FastMCP handles CLI arguments and transport setup automatically
     mcp.run()
