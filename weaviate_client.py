@@ -1,6 +1,5 @@
 import os
 from typing import Any
-
 import weaviate
 from weaviate.classes.init import Auth, AdditionalConfig, Timeout
 from weaviate.classes.query import MetadataQuery
@@ -15,7 +14,6 @@ _client: weaviate.WeaviateClient | None = None
 _agent: QueryAgent | None = None
 _agent_collection: str | None = None
 
-
 def get_client() -> weaviate.WeaviateClient:
     """Return a connected Weaviate Cloud client (singleton)."""
     global _client
@@ -24,18 +22,20 @@ def get_client() -> weaviate.WeaviateClient:
         key = os.getenv("WEAVIATE_API_KEY")
         if not url or not key:
             raise RuntimeError("WEAVIATE_URL and WEAVIATE_API_KEY must be set")
-
+        
         headers: dict[str, str] = {}
         hf = os.getenv("HUGGINGFACE_API_KEY")
         if hf:
             headers["X-HuggingFace-Api-Key"] = hf
+            
         openai = os.getenv("OPENAI_API_KEY")
         if openai:
             headers["X-OpenAI-Api-Key"] = openai
+            
         cohere = os.getenv("COHERE_API_KEY")
         if cohere:
             headers["X-Cohere-Api-Key"] = cohere
-
+            
         _client = weaviate.connect_to_weaviate_cloud(
             cluster_url=url,
             auth_credentials=Auth.api_key(key),
@@ -46,7 +46,6 @@ def get_client() -> weaviate.WeaviateClient:
         )
     return _client
 
-
 def get_collection(collection_name: str | None = None):
     """Return the named collection (defaults to TestingData)."""
     name = collection_name or COLLECTION_NAME
@@ -54,7 +53,6 @@ def get_collection(collection_name: str | None = None):
     if not client.collections.exists(name):
         raise RuntimeError(f"Collection '{name}' does not exist in Weaviate")
     return client.collections.get(name)
-
 
 def search_collection(
     query: str,
@@ -79,7 +77,6 @@ def search_collection(
             "chunk_id",
         ],
     )
-
     results: list[dict[str, Any]] = []
     for obj in response.objects:
         item = dict(obj.properties)
@@ -87,7 +84,6 @@ def search_collection(
             item["score"] = obj.metadata.score
         results.append(item)
     return results
-
 
 def get_agent(collection_name: str | None = None) -> QueryAgent:
     """Return a QueryAgent bound to the given collection (cached)."""
@@ -108,12 +104,11 @@ def get_agent(collection_name: str | None = None) -> QueryAgent:
         _agent_collection = name
     return _agent
 
-
 def close_client() -> None:
     """Close the Weaviate client and clear cached agent."""
     global _client, _agent, _agent_collection
     if _client is not None:
         _client.close()
-        _client = None
+    _client = None
     _agent = None
     _agent_collection = None
