@@ -14,8 +14,6 @@ mcp = FastMCP("SOC 101 Sociology Assistant")
 # ---------------------------------------------------------------------------
 # 1. MCP Tools (Actions the AI client can execute)
 # ---------------------------------------------------------------------------
-
-
 @mcp.tool()
 def ask_sociology_question(question: str) -> str:
     """
@@ -25,7 +23,6 @@ def ask_sociology_question(question: str) -> str:
     try:
         agent = get_agent()
         result = agent.ask(question)
-
         sources = []
         for s in getattr(result, "sources", []) or []:
             props = getattr(s, "properties", None) or {}
@@ -38,12 +35,10 @@ def ask_sociology_question(question: str) -> str:
                     "chunk_id": props.get("chunk_id"),
                 }
             )
-
         raw_answer = getattr(result, "final_answer", None) or str(result)
         return format_answer(raw_answer, sources, include_sources=True)
     except Exception as e:
         return f"Agent error: {e}"
-
 
 @mcp.tool()
 def search_sociology_passages(
@@ -59,12 +54,9 @@ def search_sociology_passages(
     except Exception as e:
         return f"Search error: {e}"
 
-
 # ---------------------------------------------------------------------------
 # 2. MCP Resources (Context the AI client can inspect)
 # ---------------------------------------------------------------------------
-
-
 @mcp.resource("system://status")
 def get_system_status() -> str:
     """Check the connection status of the Weaviate cluster and target collection."""
@@ -79,7 +71,6 @@ def get_system_status() -> str:
         )
     except Exception as e:
         return f"System Status: OFFLINE\nError: {e}"
-
 
 # ---------------------------------------------------------------------------
 # Entry Point
