@@ -1,8 +1,7 @@
-import os
+=import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from fastmcp import FastMCP
 
 from weaviate_client import (
     get_agent,
@@ -26,61 +25,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# 1. FastMCP Tool Definitions
-# ---------------------------------------------------------------------------
-mcp = FastMCP("SOC 101 Sociology Assistant")
-
-
-@mcp.tool()
-def ask_sociology_question(question: str) -> str:
-    """
-    Query the Introduction to Sociology course materials to answer natural-language questions.
-    Returns a grounded answer with module, heading, and page citations.
-    """
-    try:
-        agent = get_agent()
-        result = agent.ask(question)
-    except Exception as e:
-        return f"Agent error: {e}"
-
-    sources = []
-    for s in getattr(result, "sources", []) or []:
-        props = getattr(s, "properties", None) or {}
-        sources.append(
-            {
-                "heading": props.get("heading"),
-                "module_title": props.get("module_title"),
-                "page": props.get("page"),
-                "source": props.get("source"),
-                "chunk_id": props.get("chunk_id"),
-            }
-        )
-
-    raw_answer = getattr(result, "final_answer", None) or str(result)
-    return format_answer(raw_answer, sources, include_sources=True)
-
-
-@mcp.tool()
-def search_sociology_passages(
-    query: str, limit: int = 5, alpha: float = 0.7
-) -> str:
-    """
-    Perform a hybrid search against the SOC 101 collection without LLM answer generation.
-    Returns ranked passages with metadata citations.
-    """
-    try:
-        hits = search_collection(query, limit=limit, alpha=alpha)
-        return format_search_results(hits)
-    except Exception as e:
-        return f"Search error: {e}"
-
-
-# Mount FastMCP endpoints onto the existing FastAPI application
-# FastMCP handles SSE connections on the mounted route
-app.mount("/mcp", mcp.sse_app)
-
-# ---------------------------------------------------------------------------
-# 2. Existing REST Endpoints (Unchanged)
+# REST Endpoints
 # ---------------------------------------------------------------------------
 
 
