@@ -18,7 +18,7 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: PYTHON_VERSION
-        value: "3.13.0"
+        value: "3.12" # Recommended: 3.12 is highly stable. 3.13.0 is also fine.
       - key: ENABLE_MODULES
         value: "text2vec-huggingface"
       - key: HUGGINGFACE_API_KEY
