@@ -2,7 +2,6 @@ import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 from weaviate_client import (
     get_agent,
     search_collection,
@@ -27,12 +26,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # REST Endpoints
 # ---------------------------------------------------------------------------
-
-
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Natural-language question")
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
-
 
 class SourceItem(BaseModel):
     text: str | None = None
@@ -44,12 +40,10 @@ class SourceItem(BaseModel):
     score: float | None = None
     citation: str | None = None
 
-
 class AskResponse(BaseModel):
     answer: str
     answer_pretty: str | None = None
     sources: list[SourceItem]
-
 
 class SearchResponse(BaseModel):
     query: str
@@ -57,11 +51,9 @@ class SearchResponse(BaseModel):
     results: list[SourceItem]
     results_pretty: str | None = None
 
-
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "collection": COLLECTION_NAME}
-
 
 @app.post("/ask", response_model=AskResponse)
 def ask_question(req: AskRequest):
@@ -87,7 +79,6 @@ def ask_question(req: AskRequest):
         sources.append(item)
 
     raw_answer = getattr(result, "final_answer", None) or str(result)
-
     if req.pretty:
         pretty = format_answer(raw_answer, sources, include_sources=True)
         return AskResponse(
@@ -95,9 +86,7 @@ def ask_question(req: AskRequest):
             answer_pretty=pretty,
             sources=sources,
         )
-
     return AskResponse(answer=raw_answer, sources=sources)
-
 
 @app.get("/search", response_model=SearchResponse)
 def search(
@@ -132,14 +121,12 @@ def search(
         results.append(item)
 
     pretty_block = format_search_results(hits) if pretty else None
-
     return SearchResponse(
         query=q,
         collection=COLLECTION_NAME,
         results=results,
         results_pretty=pretty_block,
     )
-
 
 @app.on_event("shutdown")
 def _shutdown():
