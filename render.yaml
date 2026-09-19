@@ -15,11 +15,15 @@ services:
         sync: false
       - key: WEAVIATE_COLLECTION
         value: TestingData
+      # Prefer explicit origins in production. "*" is convenient but less secure.
       - key: ALLOWED_ORIGINS
-        value: "*"
+        value: "http://localhost:3000,http://localhost:8000"
       - key: PYTHON_VERSION
-        value: "3.12" # Recommended: 3.12 is highly stable. 3.13.0 is also fine.
+        value: "3.12"
       - key: ENABLE_MODULES
         value: "text2vec-huggingface"
       - key: HUGGINGFACE_API_KEY
+        sync: false
+      # Optional – only needed if you later add auth to the MCP layer
+      - key: API_KEY
         sync: false
