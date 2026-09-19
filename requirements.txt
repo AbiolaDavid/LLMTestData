@@ -3,9 +3,3 @@ uvicorn[standard]
 pydantic>=2
 python-dotenv
 weaviate-client[agents]
-transformers
-sentence-transformers
-torch
-accelerate
-huggingface-hub
-numpy
