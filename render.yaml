@@ -1,4 +1,7 @@
 services:
+  # ----------------------------------------------------------------
+  # Service 1: the FastAPI RAG API (holds the Weaviate + API_KEY)
+  # ----------------------------------------------------------------
   - type: web
     name: weaviate-query-api
     runtime: python
@@ -25,3 +28,25 @@ services:
         sync: false
       - key: API_KEY
         sync: false
+
+  # ----------------------------------------------------------------
+  # Service 2: the proxy that hides API_KEY from the browser
+  # ----------------------------------------------------------------
+  - type: web
+    name: abiola-proxy
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r proxy-requirements.txt
+    startCommand: uvicorn proxy:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: UPSTREAM_URL
+        value: "https://llmtestdata.onrender.com"
+      - key: UPSTREAM_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "http://localhost:3000,https://your-frontend.vercel.app"
+      - key: PYTHON_VERSION
+        value: "3.12"
