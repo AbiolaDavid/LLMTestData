@@ -5,25 +5,21 @@ services:
     plan: free
     region: oregon
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: fastmcp run server.py --transport http --host 0.0.0.0 --port $PORT
-    healthCheckPath: /
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
     autoDeploy: true
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
       - key: WEAVIATE_URL
         sync: false
       - key: WEAVIATE_API_KEY
         sync: false
       - key: WEAVIATE_COLLECTION
         value: TestingData
-      # Prefer explicit origins in production. "*" is convenient but less secure.
+      - key: API_KEY
+        sync: false
       - key: ALLOWED_ORIGINS
         value: "http://localhost:3000,http://localhost:8000"
-      - key: PYTHON_VERSION
-        value: "3.12"
-      - key: ENABLE_MODULES
-        value: "text2vec-huggingface"
       - key: HUGGINGFACE_API_KEY
-        sync: false
-      # Optional – only needed if you later add auth to the MCP layer
-      - key: API_KEY
         sync: false
