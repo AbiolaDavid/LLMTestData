@@ -5,8 +5,8 @@ services:
     plan: free
     region: oregon
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: fastmcp run server.py --transport http --host 0.0.0.0 --port $PORT
-    healthCheckPath: /sse
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
     autoDeploy: true
     envVars:
       - key: WEAVIATE_URL
