@@ -1,11 +1,10 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, status
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 
 from weaviate_client import (
     get_agent,
@@ -34,20 +33,27 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 if not ALLOWED_ORIGINS:
-    # Safe default for local development only
     ALLOWED_ORIGINS = ["http://localhost:3000", "http://localhost:8000"]
+
+# ---------------------------------------------------------------------------
+# Lifespan (replaces deprecated @app.on_event)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: nothing to do — Weaviate client is lazy-initialized.
+    yield
+    # Shutdown: close the Weaviate client cleanly.
+    close_client()
+
 
 # ---------------------------------------------------------------------------
 # App & middleware
 # ---------------------------------------------------------------------------
-limiter = Limiter(key_func=get_remote_address)
-
 app = FastAPI(
     title="SOC 101 RAG API",
     description="Query the TestingData Weaviate collection (Introduction to Sociology).",
+    lifespan=lifespan,
 )
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,6 +74,7 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
         )
     return x_api_key
 
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -80,6 +87,7 @@ class AskRequest(BaseModel):
     )
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
 
+
 class SourceItem(BaseModel):
     text: str | None = None
     source: str | None = None
@@ -90,10 +98,12 @@ class SourceItem(BaseModel):
     score: float | None = None
     citation: str | None = None
 
+
 class AskResponse(BaseModel):
     answer: str
     answer_pretty: str | None = None
     sources: list[SourceItem]
+
 
 class SearchResponse(BaseModel):
     query: str
@@ -101,16 +111,22 @@ class SearchResponse(BaseModel):
     results: list[SourceItem]
     results_pretty: str | None = None
 
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "SOC 101 RAG API"}
+
+
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "collection": COLLECTION_NAME}
 
+
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
-@limiter.limit("10/minute")
-def ask_question(request: Request, req: AskRequest):
+def ask_question(req: AskRequest):
     """RAG endpoint: QueryAgent searches TestingData and generates an answer."""
     try:
         agent = get_agent()
@@ -140,17 +156,12 @@ def ask_question(request: Request, req: AskRequest):
 
     if req.pretty:
         pretty = format_answer(raw_answer, sources, include_sources=True)
-        return AskResponse(
-            answer=pretty,
-            answer_pretty=pretty,
-            sources=sources,
-        )
+        return AskResponse(answer=pretty, answer_pretty=pretty, sources=sources)
     return AskResponse(answer=raw_answer, sources=sources)
 
+
 @app.get("/search", response_model=SearchResponse, dependencies=[Depends(verify_api_key)])
-@limiter.limit("30/minute")
 def search(
-    request: Request,
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     limit: int = Query(8, ge=1, le=30, description="Max number of chunks to return"),
     alpha: float = Query(
@@ -171,7 +182,7 @@ def search(
             detail="An internal error occurred while searching.",
         )
 
-    results = []
+    results: list[SourceItem] = []
     for h in hits:
         item = SourceItem(
             text=h.get("text"),
@@ -192,7 +203,3 @@ def search(
         results=results,
         results_pretty=pretty_block,
     )
-
-@app.on_event("shutdown")
-def _shutdown():
-    close_client()
