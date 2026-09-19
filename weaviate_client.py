@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Any
 import weaviate
 from weaviate.classes.init import Auth, AdditionalConfig, Timeout
@@ -8,11 +9,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 COLLECTION_NAME = os.getenv("WEAVIATE_COLLECTION", "TestingData")
 
 _client: weaviate.WeaviateClient | None = None
 _agent: QueryAgent | None = None
 _agent_collection: str | None = None
+
 
 def get_client() -> weaviate.WeaviateClient:
     """Return a connected Weaviate Cloud client (singleton)."""
@@ -22,29 +26,31 @@ def get_client() -> weaviate.WeaviateClient:
         key = os.getenv("WEAVIATE_API_KEY")
         if not url or not key:
             raise RuntimeError("WEAVIATE_URL and WEAVIATE_API_KEY must be set")
-        
+
         headers: dict[str, str] = {}
-        hf = os.getenv("HUGGINGFACE_API_KEY")
-        if hf:
+        if hf := os.getenv("HUGGINGFACE_API_KEY"):
             headers["X-HuggingFace-Api-Key"] = hf
-            
-        openai = os.getenv("OPENAI_API_KEY")
-        if openai:
+        if openai := os.getenv("OPENAI_API_KEY"):
             headers["X-OpenAI-Api-Key"] = openai
-            
-        cohere = os.getenv("COHERE_API_KEY")
-        if cohere:
+        if cohere := os.getenv("COHERE_API_KEY"):
             headers["X-Cohere-Api-Key"] = cohere
-            
-        _client = weaviate.connect_to_weaviate_cloud(
-            cluster_url=url,
-            auth_credentials=Auth.api_key(key),
-            headers=headers or None,
-            additional_config=AdditionalConfig(
-                timeout=Timeout(init=60, query=240, insert=240)
-            ),
-        )
+
+        try:
+            _client = weaviate.connect_to_weaviate_cloud(
+                cluster_url=url,
+                auth_credentials=Auth.api_key(key),
+                headers=headers or None,
+                additional_config=AdditionalConfig(
+                    timeout=Timeout(init=60, query=240, insert=240)
+                ),
+            )
+            logger.info("Weaviate client connected successfully")
+        except Exception as e:
+            logger.error(f"Failed to connect to Weaviate: {e}", exc_info=True)
+            raise RuntimeError("Unable to connect to Weaviate") from e
+
     return _client
+
 
 def get_collection(collection_name: str | None = None):
     """Return the named collection (defaults to TestingData)."""
@@ -53,6 +59,7 @@ def get_collection(collection_name: str | None = None):
     if not client.collections.exists(name):
         raise RuntimeError(f"Collection '{name}' does not exist in Weaviate")
     return client.collections.get(name)
+
 
 def search_collection(
     query: str,
@@ -85,12 +92,13 @@ def search_collection(
         results.append(item)
     return results
 
+
 def get_agent(collection_name: str | None = None) -> QueryAgent:
     """Return a QueryAgent bound to the given collection (cached)."""
     global _agent, _agent_collection
     name = collection_name or COLLECTION_NAME
     if _agent is None or _agent_collection != name:
-        get_collection(name)
+        get_collection(name)  # validates collection exists
         _agent = QueryAgent(
             client=get_client(),
             collections=[name],
@@ -102,13 +110,19 @@ def get_agent(collection_name: str | None = None) -> QueryAgent:
             ),
         )
         _agent_collection = name
+        logger.info(f"QueryAgent initialized for collection '{name}'")
     return _agent
+
 
 def close_client() -> None:
     """Close the Weaviate client and clear cached agent."""
     global _client, _agent, _agent_collection
     if _client is not None:
-        _client.close()
+        try:
+            _client.close()
+            logger.info("Weaviate client closed")
+        except Exception as e:
+            logger.warning(f"Error while closing Weaviate client: {e}")
     _client = None
     _agent = None
     _agent_collection = None
