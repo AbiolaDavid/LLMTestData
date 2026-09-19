@@ -4,3 +4,9 @@ pydantic>=2
 python-dotenv
 weaviate-client[agents]
 fastmcp
+transformers
+sentence-transformers
+torch
+accelerate
+huggingface-hub
+numpy
