@@ -1,4 +1,5 @@
 import os
+import logging
 from fastmcp import FastMCP
 from weaviate_client import (
     get_agent,
@@ -8,11 +9,19 @@ from weaviate_client import (
 )
 from formatter import format_answer, format_search_results
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
 # Initialize the FastMCP server
+# ---------------------------------------------------------------------------
 mcp = FastMCP("SOC 101 Sociology Assistant")
 
 # ---------------------------------------------------------------------------
-# 1. MCP Tools (Actions the AI client can execute)
+# 1. MCP Tools
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def ask_sociology_question(question: str) -> str:
@@ -20,9 +29,15 @@ def ask_sociology_question(question: str) -> str:
     Query the Introduction to Sociology course materials to answer natural-language questions.
     Returns a grounded answer with module, heading, and page citations.
     """
+    if not question or not question.strip():
+        return "Error: question cannot be empty."
+    if len(question) > 2000:
+        return "Error: question is too long (max 2000 characters)."
+
     try:
         agent = get_agent()
         result = agent.ask(question)
+
         sources = []
         for s in getattr(result, "sources", []) or []:
             props = getattr(s, "properties", None) or {}
@@ -35,10 +50,14 @@ def ask_sociology_question(question: str) -> str:
                     "chunk_id": props.get("chunk_id"),
                 }
             )
+
         raw_answer = getattr(result, "final_answer", None) or str(result)
         return format_answer(raw_answer, sources, include_sources=True)
+
     except Exception as e:
-        return f"Agent error: {e}"
+        logger.error(f"Agent error: {e}", exc_info=True)
+        return "An internal error occurred while generating the answer."
+
 
 @mcp.tool()
 def search_sociology_passages(
@@ -48,14 +67,25 @@ def search_sociology_passages(
     Perform a direct hybrid search against the SOC 101 collection without LLM answer generation.
     Returns ranked passages with source citations.
     """
+    if not query or not query.strip():
+        return "Error: query cannot be empty."
+    if len(query) > 500:
+        return "Error: query is too long (max 500 characters)."
+    if not (1 <= limit <= 30):
+        return "Error: limit must be between 1 and 30."
+    if not (0.0 <= alpha <= 1.0):
+        return "Error: alpha must be between 0.0 and 1.0."
+
     try:
         hits = search_collection(query, limit=limit, alpha=alpha)
         return format_search_results(hits)
     except Exception as e:
-        return f"Search error: {e}"
+        logger.error(f"Search error: {e}", exc_info=True)
+        return "An internal error occurred while searching."
+
 
 # ---------------------------------------------------------------------------
-# 2. MCP Resources (Context the AI client can inspect)
+# 2. MCP Resources
 # ---------------------------------------------------------------------------
 @mcp.resource("system://status")
 def get_system_status() -> str:
@@ -67,14 +97,16 @@ def get_system_status() -> str:
         return (
             f"System Status: ONLINE\n"
             f"Weaviate Connected: {is_ready}\n"
-            f"Target Collection ('{COLLECTION_NAME}'): {'Found' if has_collection else 'Missing'}"
+            f"Target Collection ('{COLLECTION_NAME}'): "
+            f"{'Found' if has_collection else 'Missing'}"
         )
     except Exception as e:
-        return f"System Status: OFFLINE\nError: {e}"
+        logger.error(f"Status check error: {e}", exc_info=True)
+        return "System Status: OFFLINE\nUnable to reach Weaviate."
+
 
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # FastMCP handles CLI arguments and transport setup automatically
     mcp.run()
