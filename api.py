@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openai import OpenAI  # NEW: For Cohere compatibility endpoint
+import cohere # NEW: For Cohere compatibility endpoint
 
 from weaviate_client import (
     get_agent,
@@ -31,12 +31,8 @@ COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
 if not COHERE_API_KEY:
     logger.warning("COHERE_API_KEY not set. External LLM expansion will be disabled.")
 
-# NEW: Initialize Cohere client via OpenAI compatibility layer
-cohere_client = OpenAI(
-    base_url="https://api.cohere.ai/compatibility/v1",
-    api_key=COHERE_API_KEY,
-)
-
+# NEW: Initialize Native Cohere ClientV2
+cohere_client = cohere.ClientV2(api_key=COHERE_API_KEY) if COHERE_API_KEY else None
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv("ALLOWED_ORIGINS", "").split(",")
