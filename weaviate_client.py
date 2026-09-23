@@ -1,6 +1,7 @@
 import os
 import logging
 from typing import Any
+
 import weaviate
 from weaviate.classes.init import Auth, AdditionalConfig, Timeout
 from weaviate.classes.query import MetadataQuery
@@ -8,7 +9,6 @@ from weaviate.agents.query import QueryAgent
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = os.getenv("WEAVIATE_COLLECTION", "TestingData")
@@ -64,7 +64,7 @@ def get_collection(collection_name: str | None = None):
 def search_collection(
     query: str,
     *,
-    limit: int = 8,
+    limit: int = 30,
     alpha: float = 0.7,
     collection_name: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -84,6 +84,7 @@ def search_collection(
             "chunk_id",
         ],
     )
+
     results: list[dict[str, Any]] = []
     for obj in response.objects:
         item = dict(obj.properties)
@@ -97,20 +98,27 @@ def get_agent(collection_name: str | None = None) -> QueryAgent:
     """Return a QueryAgent bound to the given collection (cached)."""
     global _agent, _agent_collection
     name = collection_name or COLLECTION_NAME
+
     if _agent is None or _agent_collection != name:
         get_collection(name)  # validates collection exists
         _agent = QueryAgent(
             client=get_client(),
             collections=[name],
             system_prompt=(
-                "You are a helpful teaching assistant for an Introduction to Sociology "
-                "course. Answer only from the provided course material. Cite the module "
-                "title, heading and page when possible. If the answer is not in the "
-                "material, say you do not know."
+                "You are a multi-course academic teaching assistant. "
+                "Answer using only the retrieved course material. "
+                "Identify the relevant course/subject from context; do not assume one course. "
+                "Be clear, accurate, and student-friendly. "
+                "Synthesize relevant sources. "
+                "Cite source, module_title, heading, and page when available. "
+                "Never invent facts, citations, or page numbers. "
+                "If the context is insufficient, say the answer is not in the provided materials. "
+                "If the question is ambiguous, ask for clarification."
             ),
         )
         _agent_collection = name
         logger.info(f"QueryAgent initialized for collection '{name}'")
+
     return _agent
 
 
@@ -123,6 +131,6 @@ def close_client() -> None:
             logger.info("Weaviate client closed")
         except Exception as e:
             logger.warning(f"Error while closing Weaviate client: {e}")
-    _client = None
-    _agent = None
-    _agent_collection = None
+        _client = None
+        _agent = None
+        _agent_collection = None
