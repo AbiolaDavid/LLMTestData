@@ -1,10 +1,10 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from openai import OpenAI  # NEW: For Cohere compatibility endpoint
 
 from weaviate_client import (
     get_agent,
@@ -27,6 +27,16 @@ API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY environment variable is required")
 
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
+if not COHERE_API_KEY:
+    logger.warning("COHERE_API_KEY not set. External LLM expansion will be disabled.")
+
+# NEW: Initialize Cohere client via OpenAI compatibility layer
+cohere_client = OpenAI(
+    base_url="https://api.cohere.ai/compatibility/v1",
+    api_key=COHERE_API_KEY,
+)
+
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv("ALLOWED_ORIGINS", "").split(",")
@@ -45,7 +55,6 @@ async def lifespan(app: FastAPI):
     # Shutdown: close the Weaviate client cleanly.
     close_client()
 
-
 # ---------------------------------------------------------------------------
 # App & middleware
 # ---------------------------------------------------------------------------
@@ -54,7 +63,6 @@ app = FastAPI(
     description="Query the TestingData Weaviate collection (Introduction to Sociology).",
     lifespan=lifespan,
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -74,7 +82,6 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
         )
     return x_api_key
 
-
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -82,11 +89,10 @@ class AskRequest(BaseModel):
     question: str = Field(
         ...,
         min_length=1,
-        max_length=2000,
+        max_length=5000,
         description="Natural-language question",
     )
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
-
 
 class SourceItem(BaseModel):
     text: str | None = None
@@ -98,12 +104,10 @@ class SourceItem(BaseModel):
     score: float | None = None
     citation: str | None = None
 
-
 class AskResponse(BaseModel):
     answer: str
     answer_pretty: str | None = None
     sources: list[SourceItem]
-
 
 class SearchResponse(BaseModel):
     query: str
@@ -111,23 +115,26 @@ class SearchResponse(BaseModel):
     results: list[SourceItem]
     results_pretty: str | None = None
 
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "SOC 101 RAG API"}
-
+    return {"status": "ok", "service": "Fulafia AI RAG API"}
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "collection": COLLECTION_NAME}
 
-
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
 def ask_question(req: AskRequest):
-    """RAG endpoint: QueryAgent searches TestingData and generates an answer."""
+    """
+    RAG endpoint: 
+    1. QueryAgent searches TestingData (Internal).
+    2. Cohere expands on the answer using general knowledge (External).
+    3. Responses are aggregated and separated by a horizontal line.
+    """
+    # --- STEP 1: Execute Internal Weaviate Query ---
     try:
         agent = get_agent()
         result = agent.ask(req.question)
@@ -152,13 +159,76 @@ def ask_question(req: AskRequest):
         item.citation = format_source(item.model_dump())
         sources.append(item)
 
-    raw_answer = getattr(result, "final_answer", None) or str(result)
+    internal_answer = getattr(result, "final_answer", None) or str(result)
+    
+    # Detect if the internal agent failed to find an answer
+    is_internal_empty = "not in the provided materials" in internal_answer.lower()
+
+    # --- STEP 2: Generate External Response via Cohere ---
+    external_answer = "External expansion temporarily unavailable."
+    
+    try:
+        if is_internal_empty:
+            # Scenario B: Internal failed, Cohere acts as primary generator
+            system_prompt = (
+                "You are an expert academic assistant. The internal knowledge base could not "
+                "find an answer to the user's question. Provide a comprehensive, well-structured "
+                "answer based entirely on your general pre-trained academic knowledge."
+            )
+            user_prompt = f"Original Question: {req.question}"
+        else:
+            # Scenario A: Internal succeeded, Cohere acts as supplementary researcher
+            system_prompt = (
+                "You are an expert academic supplement. A user asked a question, and an internal "
+                "knowledge base provided a grounded answer. Your task is to provide a related, "
+                "broader, or complementary perspective using your general pre-trained knowledge. "
+                "Provide real-world examples, broader sociological context, or related theories. "
+                "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite the internal sources. "
+                "3) Provide new, additive value only."
+            )
+            user_prompt = f"Original Question: {req.question}\n\nInternal Knowledge Base Answer: {internal_answer}"
+
+        # Call Cohere via OpenAI compatibility layer
+        response = cohere_client.chat.completions.create(
+            model="command-r-plus",  # Use "command-r" for lower latency/cost
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+        )
+        external_answer = (response.choices[0].message.content or "").strip()
+
+    except Exception as e:
+        logger.error(f"External LLM (Cohere) error: {e}", exc_info=True)
+        # Fail gracefully: we still return the internal answer if the external call fails
+
+    # --- STEP 3: Application-Layer Aggregation ---
+    # Construct the dual-response payload separated by a horizontal line
+    final_dual_response = (
+        f"**Internal Response:**\n{internal_answer}\n\n"
+        f"---\n\n"
+        f"**External Source:**\n{external_answer}"
+    )
 
     if req.pretty:
-        pretty = format_answer(raw_answer, sources, include_sources=True)
-        return AskResponse(answer=pretty, answer_pretty=pretty, sources=sources)
-    return AskResponse(answer=raw_answer, sources=sources)
+        # Format the internal part with its citations, then append the external part
+        pretty_internal = format_answer(internal_answer, sources, include_sources=True)
+        pretty_dual_response = (
+            f"{pretty_internal}\n\n"
+            f"---\n\n"
+            f"**External Source:**\n{external_answer}"
+        )
+        return AskResponse(
+            answer=final_dual_response,
+            answer_pretty=pretty_dual_response,
+            sources=sources
+        )
 
+    return AskResponse(
+        answer=final_dual_response,
+        sources=sources
+    )
 
 @app.get("/search", response_model=SearchResponse, dependencies=[Depends(verify_api_key)])
 def search(
