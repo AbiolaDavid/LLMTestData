@@ -186,12 +186,10 @@ def ask_question(req: AskRequest):
 
             # Call Cohere natively using V2 API
             response = cohere_client.chat(
-                model="command-a-03-2025",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
-            )
+    model="command-r-plus-08-2024",
+    preamble=system_prompt,
+    messages=[{"role": "user", "content": user_prompt}],
+)
             # Extract text from Cohere V2 response structure
             external_answer = response.message.content[0].text
 
