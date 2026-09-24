@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import cohere # NEW: For Cohere compatibility endpoint
+import cohere  # For Cohere compatibility endpoint
 
 from weaviate_client import (
     get_agent,
@@ -31,8 +31,12 @@ COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
 if not COHERE_API_KEY:
     logger.warning("COHERE_API_KEY not set. External LLM expansion will be disabled.")
 
-# NEW: Initialize Native Cohere ClientV2
+# Model choice (V2 API). Override via env var if you want to swap models later.
+COHERE_MODEL = os.environ.get("COHERE_MODEL", "command-r-plus-08-2024")
+
+# Initialize Native Cohere ClientV2
 cohere_client = cohere.ClientV2(api_key=COHERE_API_KEY) if COHERE_API_KEY else None
+
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv("ALLOWED_ORIGINS", "").split(",")
@@ -41,15 +45,44 @@ ALLOWED_ORIGINS = [
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:3000", "http://localhost:8000"]
 
+
+# ---------------------------------------------------------------------------
+# Cohere health check (run once at startup so failures are visible early)
+# ---------------------------------------------------------------------------
+def _cohere_startup_check() -> None:
+    """Ping Cohere once at boot so bad keys / bad model names surface immediately."""
+    global cohere_client
+    if not cohere_client:
+        return
+    try:
+        cohere_client.chat(
+            model=COHERE_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5,
+        )
+        logger.info("Cohere V2 client OK (model=%s)", COHERE_MODEL)
+    except Exception as e:
+        logger.error(
+            "Cohere startup check failed (model=%s): %s. "
+            "Disabling external expansion for this process.",
+            COHERE_MODEL,
+            e,
+            exc_info=True,
+        )
+        cohere_client = None  # disable so `if cohere_client` short-circuits
+
+
 # ---------------------------------------------------------------------------
 # Lifespan (replaces deprecated @app.on_event)
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: nothing to do — Weaviate client is lazy-initialized.
+    # Startup: verify Cohere is reachable, Weaviate client is lazy-initialized.
+    _cohere_startup_check()
     yield
     # Shutdown: close the Weaviate client cleanly.
     close_client()
+
 
 # ---------------------------------------------------------------------------
 # App & middleware
@@ -67,6 +100,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
@@ -77,6 +111,7 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
             detail="Invalid or missing API key",
         )
     return x_api_key
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -90,6 +125,7 @@ class AskRequest(BaseModel):
     )
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
 
+
 class SourceItem(BaseModel):
     text: str | None = None
     source: str | None = None
@@ -100,16 +136,86 @@ class SourceItem(BaseModel):
     score: float | None = None
     citation: str | None = None
 
+
 class AskResponse(BaseModel):
     answer: str
     answer_pretty: str | None = None
     sources: list[SourceItem]
+
 
 class SearchResponse(BaseModel):
     query: str
     collection: str
     results: list[SourceItem]
     results_pretty: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _extract_cohere_text(response) -> str:
+    """
+    Robustly pull the text out of a Cohere V2 chat response.
+    Falls back gracefully if the shape is unexpected.
+    """
+    try:
+        blocks = response.message.content
+        text = next(
+            (
+                getattr(b, "text", None)
+                for b in blocks
+                if getattr(b, "text", None)
+            ),
+            None,
+        )
+        if text:
+            return text.strip()
+    except Exception:
+        logger.error("Unexpected Cohere response shape: %r", response, exc_info=True)
+    return "External source returned no content."
+
+
+def _call_cohere_external(question: str, internal_answer: str, is_internal_empty: bool) -> str:
+    """
+    Call Cohere V2 chat and return the external-supplement text.
+    Uses `preamble=` for the system prompt (works across V2 SDK versions).
+    """
+    if not cohere_client:
+        return "External expansion temporarily unavailable."
+
+    if is_internal_empty:
+        preamble = (
+            "You are an expert academic assistant. The internal knowledge base could not "
+            "find an answer to the user's question. Provide a comprehensive, well-structured "
+            "answer based entirely on your general pre-trained academic knowledge."
+        )
+        user_prompt = f"Original Question: {question}"
+    else:
+        preamble = (
+            "You are an expert academic supplement. A user asked a question, and an internal "
+            "knowledge base provided a grounded answer. Your task is to provide a related, "
+            "broader, or complementary perspective using your general pre-trained knowledge. "
+            "Provide real-world examples, broader sociological context, or related theories. "
+            "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite the internal sources. "
+            "3) Provide new, additive value only."
+        )
+        user_prompt = (
+            f"Original Question: {question}\n\n"
+            f"Internal Knowledge Base Answer: {internal_answer}"
+        )
+
+    try:
+        response = cohere_client.chat(
+            model=COHERE_MODEL,
+            preamble=preamble,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return _extract_cohere_text(response)
+    except Exception as e:
+        logger.error("External LLM (Cohere) error: %s", e, exc_info=True)
+        # Fail gracefully: internal answer is still returned.
+        return "External expansion temporarily unavailable."
+
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -118,14 +224,21 @@ class SearchResponse(BaseModel):
 def root():
     return {"status": "ok", "service": "Fulafia AI RAG API"}
 
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "collection": COLLECTION_NAME}
+    return {
+        "status": "ok",
+        "collection": COLLECTION_NAME,
+        "cohere_enabled": cohere_client is not None,
+        "cohere_model": COHERE_MODEL if cohere_client else None,
+    }
+
 
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
 def ask_question(req: AskRequest):
     """
-    RAG endpoint: 
+    RAG endpoint:
     1. QueryAgent searches TestingData (Internal).
     2. Cohere expands on the answer using general knowledge (External).
     3. Responses are aggregated and separated by a horizontal line.
@@ -156,49 +269,18 @@ def ask_question(req: AskRequest):
         sources.append(item)
 
     internal_answer = getattr(result, "final_answer", None) or str(result)
-    
+
     # Detect if the internal agent failed to find an answer
     is_internal_empty = "not in the provided materials" in internal_answer.lower()
 
-    # --- STEP 2: Generate External Response via Cohere ---
-        # --- STEP 2: Generate External Response via Native Cohere ---
-    external_answer = "External expansion temporarily unavailable."
-    
-    if cohere_client:
-        try:
-            if is_internal_empty:
-                system_prompt = (
-                    "You are an expert academic assistant. The internal knowledge base could not "
-                    "find an answer to the user's question. Provide a comprehensive, well-structured "
-                    "answer based entirely on your general pre-trained academic knowledge."
-                )
-                user_prompt = f"Original Question: {req.question}"
-            else:
-                system_prompt = (
-                    "You are an expert academic supplement. A user asked a question, and an internal "
-                    "knowledge base provided a grounded answer. Your task is to provide a related, "
-                    "broader, or complementary perspective using your general pre-trained knowledge. "
-                    "Provide real-world examples, broader sociological context, or related theories. "
-                    "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite the internal sources. "
-                    "3) Provide new, additive value only."
-                )
-                user_prompt = f"Original Question: {req.question}\n\nInternal Knowledge Base Answer: {internal_answer}"
-
-            # Call Cohere natively using V2 API
-            response = cohere_client.chat(
-    model="command-r-plus-08-2024",
-    preamble=system_prompt,
-    messages=[{"role": "user", "content": user_prompt}],
-)
-            # Extract text from Cohere V2 response structure
-            external_answer = response.message.content[0].text
-
-        except Exception as e:
-            logger.error(f"External LLM (Cohere) error: {e}", exc_info=True)
-        # Fail gracefully: we still return the internal answer if the external call fails
+    # --- STEP 2: Generate External Response via Cohere (V2) ---
+    external_answer = _call_cohere_external(
+        question=req.question,
+        internal_answer=internal_answer,
+        is_internal_empty=is_internal_empty,
+    )
 
     # --- STEP 3: Application-Layer Aggregation ---
-    # Construct the dual-response payload separated by a horizontal line
     final_dual_response = (
         f"**Internal Response:**\n{internal_answer}\n\n"
         f"---\n\n"
@@ -206,7 +288,6 @@ def ask_question(req: AskRequest):
     )
 
     if req.pretty:
-        # Format the internal part with its citations, then append the external part
         pretty_internal = format_answer(internal_answer, sources, include_sources=True)
         pretty_dual_response = (
             f"{pretty_internal}\n\n"
@@ -216,13 +297,14 @@ def ask_question(req: AskRequest):
         return AskResponse(
             answer=final_dual_response,
             answer_pretty=pretty_dual_response,
-            sources=sources
+            sources=sources,
         )
 
     return AskResponse(
         answer=final_dual_response,
-        sources=sources
+        sources=sources,
     )
+
 
 @app.get("/search", response_model=SearchResponse, dependencies=[Depends(verify_api_key)])
 def search(
