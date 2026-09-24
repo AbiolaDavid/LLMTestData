@@ -186,7 +186,7 @@ def ask_question(req: AskRequest):
 
             # Call Cohere natively using V2 API
             response = cohere_client.chat(
-                model="command-r-plus",
+                model="command-a-03-2025",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
