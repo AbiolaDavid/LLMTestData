@@ -3,4 +3,5 @@ uvicorn[standard]
 pydantic>=2
 python-dotenv
 weaviate-client[agents]
+openai
 cohere
