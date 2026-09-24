@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import cohere  # For Cohere compatibility endpoint
+from openai import OpenAI  # NEW: OpenAI-compatible client for Cohere
 
 from weaviate_client import (
     get_agent,
@@ -27,15 +27,22 @@ API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY environment variable is required")
 
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
+COHERE_API_KEY = (os.environ.get("COHERE_API_KEY") or "").strip()
 if not COHERE_API_KEY:
     logger.warning("COHERE_API_KEY not set. External LLM expansion will be disabled.")
 
-# Model choice (V2 API). Override via env var if you want to swap models later.
-COHERE_MODEL = os.environ.get("COHERE_MODEL", "command-r-plus-08-2024")
+# Cohere OpenAI-compatible endpoint & model (overridable via env vars)
+COHERE_BASE_URL = os.environ.get(
+    "COHERE_BASE_URL", "https://api.cohere.ai/compatibility/v1"
+)
+COHERE_MODEL = os.environ.get("COHERE_MODEL", "command-a-03-2025")
 
-# Initialize Native Cohere ClientV2
-cohere_client = cohere.ClientV2(api_key=COHERE_API_KEY) if COHERE_API_KEY else None
+# Initialize OpenAI-compatible client pointing at Cohere
+cohere_client = (
+    OpenAI(base_url=COHERE_BASE_URL, api_key=COHERE_API_KEY)
+    if COHERE_API_KEY
+    else None
+)
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -55,12 +62,12 @@ def _cohere_startup_check() -> None:
     if not cohere_client:
         return
     try:
-        cohere_client.chat(
+        cohere_client.chat.completions.create(
             model=COHERE_MODEL,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=5,
         )
-        logger.info("Cohere V2 client OK (model=%s)", COHERE_MODEL)
+        logger.info("Cohere (OpenAI-compat) client OK (model=%s)", COHERE_MODEL)
     except Exception as e:
         logger.error(
             "Cohere startup check failed (model=%s): %s. "
@@ -153,23 +160,17 @@ class SearchResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _extract_cohere_text(response) -> str:
+def _extract_openai_text(response) -> str:
     """
-    Robustly pull the text out of a Cohere V2 chat response.
+    Robustly pull the text out of an OpenAI-style chat completion response.
     Falls back gracefully if the shape is unexpected.
     """
     try:
-        blocks = response.message.content
-        text = next(
-            (
-                getattr(b, "text", None)
-                for b in blocks
-                if getattr(b, "text", None)
-            ),
-            None,
-        )
-        if text:
-            return text.strip()
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            content = getattr(choices[0].message, "content", None)
+            if content:
+                return content.strip()
     except Exception:
         logger.error("Unexpected Cohere response shape: %r", response, exc_info=True)
     return "External source returned no content."
@@ -177,21 +178,21 @@ def _extract_cohere_text(response) -> str:
 
 def _call_cohere_external(question: str, internal_answer: str, is_internal_empty: bool) -> str:
     """
-    Call Cohere V2 chat and return the external-supplement text.
-    Uses `preamble=` for the system prompt (works across V2 SDK versions).
+    Call Cohere via its OpenAI-compatible endpoint and return the external text.
+    System prompt is passed as the first message (OpenAI-style).
     """
     if not cohere_client:
         return "External expansion temporarily unavailable."
 
     if is_internal_empty:
-        preamble = (
+        system_prompt = (
             "You are an expert academic assistant. The internal knowledge base could not "
             "find an answer to the user's question. Provide a comprehensive, well-structured "
             "answer based entirely on your general pre-trained academic knowledge."
         )
         user_prompt = f"Original Question: {question}"
     else:
-        preamble = (
+        system_prompt = (
             "You are an expert academic supplement. A user asked a question, and an internal "
             "knowledge base provided a grounded answer. Your task is to provide a related, "
             "broader, or complementary perspective using your general pre-trained knowledge. "
@@ -205,12 +206,14 @@ def _call_cohere_external(question: str, internal_answer: str, is_internal_empty
         )
 
     try:
-        response = cohere_client.chat(
+        response = cohere_client.chat.completions.create(
             model=COHERE_MODEL,
-            preamble=preamble,
-            messages=[{"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        return _extract_cohere_text(response)
+        return _extract_openai_text(response)
     except Exception as e:
         logger.error("External LLM (Cohere) error: %s", e, exc_info=True)
         # Fail gracefully: internal answer is still returned.
@@ -232,6 +235,7 @@ def healthz():
         "collection": COLLECTION_NAME,
         "cohere_enabled": cohere_client is not None,
         "cohere_model": COHERE_MODEL if cohere_client else None,
+        "cohere_base_url": COHERE_BASE_URL if cohere_client else None,
     }
 
 
@@ -273,7 +277,7 @@ def ask_question(req: AskRequest):
     # Detect if the internal agent failed to find an answer
     is_internal_empty = "not in the provided materials" in internal_answer.lower()
 
-    # --- STEP 2: Generate External Response via Cohere (V2) ---
+    # --- STEP 2: Generate External Response via Cohere (OpenAI-compat) ---
     external_answer = _call_cohere_external(
         question=req.question,
         internal_answer=internal_answer,
