@@ -28,7 +28,10 @@ services:
         sync: false
       - key: API_KEY
         sync: false
-
+      - key: COHERE_API_KEY
+        sync: false
+      - key: COHERE_MODEL
+        value: "command-a-03-2025"
   # ----------------------------------------------------------------
   # Service 2: the proxy that hides API_KEY from the browser
   # ----------------------------------------------------------------
