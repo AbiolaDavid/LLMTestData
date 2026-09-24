@@ -161,42 +161,42 @@ def ask_question(req: AskRequest):
     is_internal_empty = "not in the provided materials" in internal_answer.lower()
 
     # --- STEP 2: Generate External Response via Cohere ---
+        # --- STEP 2: Generate External Response via Native Cohere ---
     external_answer = "External expansion temporarily unavailable."
     
-    try:
-        if is_internal_empty:
-            # Scenario B: Internal failed, Cohere acts as primary generator
-            system_prompt = (
-                "You are an expert academic assistant. The internal knowledge base could not "
-                "find an answer to the user's question. Provide a comprehensive, well-structured "
-                "answer based entirely on your general pre-trained academic knowledge."
-            )
-            user_prompt = f"Original Question: {req.question}"
-        else:
-            # Scenario A: Internal succeeded, Cohere acts as supplementary researcher
-            system_prompt = (
-                "You are an expert academic supplement. A user asked a question, and an internal "
-                "knowledge base provided a grounded answer. Your task is to provide a related, "
-                "broader, or complementary perspective using your general pre-trained knowledge. "
-                "Provide real-world examples, broader sociological context, or related theories. "
-                "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite the internal sources. "
-                "3) Provide new, additive value only."
-            )
-            user_prompt = f"Original Question: {req.question}\n\nInternal Knowledge Base Answer: {internal_answer}"
+    if cohere_client:
+        try:
+            if is_internal_empty:
+                system_prompt = (
+                    "You are an expert academic assistant. The internal knowledge base could not "
+                    "find an answer to the user's question. Provide a comprehensive, well-structured "
+                    "answer based entirely on your general pre-trained academic knowledge."
+                )
+                user_prompt = f"Original Question: {req.question}"
+            else:
+                system_prompt = (
+                    "You are an expert academic supplement. A user asked a question, and an internal "
+                    "knowledge base provided a grounded answer. Your task is to provide a related, "
+                    "broader, or complementary perspective using your general pre-trained knowledge. "
+                    "Provide real-world examples, broader sociological context, or related theories. "
+                    "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite the internal sources. "
+                    "3) Provide new, additive value only."
+                )
+                user_prompt = f"Original Question: {req.question}\n\nInternal Knowledge Base Answer: {internal_answer}"
 
-        # Call Cohere via OpenAI compatibility layer
-        response = cohere_client.chat.completions.create(
-            model="command-r-plus",  # Use "command-r" for lower latency/cost
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.7,
-        )
-        external_answer = (response.choices[0].message.content or "").strip()
+            # Call Cohere natively using V2 API
+            response = cohere_client.chat(
+                model="command-r-plus",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            # Extract text from Cohere V2 response structure
+            external_answer = response.message.content[0].text
 
-    except Exception as e:
-        logger.error(f"External LLM (Cohere) error: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"External LLM (Cohere) error: {e}", exc_info=True)
         # Fail gracefully: we still return the internal answer if the external call fails
 
     # --- STEP 3: Application-Layer Aggregation ---
