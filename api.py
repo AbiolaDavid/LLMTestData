@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openai import OpenAI  # NEW: OpenAI-compatible client for Cohere
+from openai import OpenAI  # OpenAI-compatible client for Cohere
 
 from weaviate_client import (
     get_agent,
@@ -80,7 +80,7 @@ def _cohere_startup_check() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lifespan (replaces deprecated @app.on_event)
+# Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -95,8 +95,8 @@ async def lifespan(app: FastAPI):
 # App & middleware
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="SOC 101 RAG API",
-    description="Query the TestingData Weaviate collection (Introduction to Sociology).",
+    title="FULafia RAG API",
+    description="Welcome to FULafia's RAG API. Combining internal knowledge base search with external LLM expansion.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -131,6 +131,8 @@ class AskRequest(BaseModel):
         description="Natural-language question",
     )
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
+    department: str | None = Field(None, description="User department context")
+    level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
 
 
 class SourceItem(BaseModel):
@@ -161,10 +163,7 @@ class SearchResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 def _extract_openai_text(response) -> str:
-    """
-    Robustly pull the text out of an OpenAI-style chat completion response.
-    Falls back gracefully if the shape is unexpected.
-    """
+    """Robustly pull text out of an OpenAI-style chat completion response."""
     try:
         choices = getattr(response, "choices", None) or []
         if choices:
@@ -176,28 +175,38 @@ def _extract_openai_text(response) -> str:
     return "External source returned no content."
 
 
-def _call_cohere_external(question: str, internal_answer: str, is_internal_empty: bool) -> str:
-    """
-    Call Cohere via its OpenAI-compatible endpoint and return the external text.
-    System prompt is passed as the first message (OpenAI-style).
-    """
+def _call_cohere_external(
+    question: str,
+    internal_answer: str,
+    is_internal_empty: bool,
+    department: str | None = None,
+    level: str | None = None,
+) -> str:
+    """Call Cohere via OpenAI-compatible endpoint with optional student context."""
     if not cohere_client:
         return "External expansion temporarily unavailable."
 
+    context_details = []
+    if department:
+        context_details.append(f"Department: {department}")
+    if level:
+        context_details.append(f"Level: {level}")
+    
+    user_context = f" [Student Info: {', '.join(context_details)}]" if context_details else ""
+
     if is_internal_empty:
         system_prompt = (
-            "You are an expert academic assistant. The internal knowledge base could not "
+            f"You are an expert academic assistant.{user_context} The internal knowledge base could not "
             "find an answer to the user's question. Provide a comprehensive, well-structured "
-            "answer based entirely on your general pre-trained academic knowledge."
+            "answer tailored appropriately to the student's level and field based on pre-trained knowledge."
         )
         user_prompt = f"Original Question: {question}"
     else:
         system_prompt = (
-            "You are an expert academic supplement. A user asked a question, and an internal "
+            f"You are an expert academic supplement.{user_context} A user asked a question, and an internal "
             "knowledge base provided a grounded answer. Your task is to provide a related, "
-            "broader, or complementary perspective using your general pre-trained knowledge. "
-            "Provide real-world examples, broader sociological context, or related theories. "
-            "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite the internal sources. "
+            "broader, or complementary perspective suited to their level and study area. "
+            "CRITICAL RULES: 1) DO NOT repeat the internal answer. 2) DO NOT cite internal sources. "
             "3) Provide new, additive value only."
         )
         user_prompt = (
@@ -216,7 +225,6 @@ def _call_cohere_external(question: str, internal_answer: str, is_internal_empty
         return _extract_openai_text(response)
     except Exception as e:
         logger.error("External LLM (Cohere) error: %s", e, exc_info=True)
-        # Fail gracefully: internal answer is still returned.
         return "External expansion temporarily unavailable."
 
 
@@ -243,13 +251,13 @@ def healthz():
 def ask_question(req: AskRequest):
     """
     RAG endpoint:
-    1. QueryAgent searches TestingData (Internal).
-    2. Cohere expands on the answer using general knowledge (External).
-    3. Responses are aggregated and separated by a horizontal line.
+    1. QueryAgent searches TestingData (Internal) filtered/guided by department and level context.
+    2. Cohere expands on the answer using contextualized general knowledge (External).
+    3. Responses are aggregated and returned.
     """
     # --- STEP 1: Execute Internal Weaviate Query ---
     try:
-        agent = get_agent()
+        agent = get_agent(department=req.department, level=req.level)
         result = agent.ask(req.question)
     except Exception as e:
         logger.error(f"Agent error: {e}", exc_info=True)
@@ -273,18 +281,18 @@ def ask_question(req: AskRequest):
         sources.append(item)
 
     internal_answer = getattr(result, "final_answer", None) or str(result)
-
-    # Detect if the internal agent failed to find an answer
     is_internal_empty = "not in the provided materials" in internal_answer.lower()
 
-    # --- STEP 2: Generate External Response via Cohere (OpenAI-compat) ---
+    # --- STEP 2: Generate External Response via Cohere ---
     external_answer = _call_cohere_external(
         question=req.question,
         internal_answer=internal_answer,
         is_internal_empty=is_internal_empty,
+        department=req.department,
+        level=req.level,
     )
 
-    # --- STEP 3: Application-Layer Aggregation ---
+    # --- STEP 3: Aggregation ---
     final_dual_response = (
         f"**Internal Response:**\n{internal_answer}\n\n"
         f"---\n\n"
@@ -320,11 +328,13 @@ def search(
         le=1.0,
         description="Hybrid search balance (0=BM25 only, 1=vector only)",
     ),
+    department: str | None = Query(None, description="Department metadata filter"),
+    level: str | None = Query(None, description="Level metadata filter"),
     pretty: bool = Query(True, description="Also return a human-readable block"),
 ):
-    """Direct hybrid search against the TestingData collection."""
+    """Direct hybrid search against the TestingData collection with optional filters."""
     try:
-        hits = search_collection(q, limit=limit, alpha=alpha)
+        hits = search_collection(q, limit=limit, alpha=alpha, department=department, level=level)
     except Exception as e:
         logger.error(f"Search error: {e}", exc_info=True)
         raise HTTPException(
