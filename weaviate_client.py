@@ -4,7 +4,7 @@ from typing import Any
 
 import weaviate
 from weaviate.classes.init import Auth, AdditionalConfig, Timeout
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery, Filter
 from weaviate.agents.query import QueryAgent
 from dotenv import load_dotenv
 
@@ -14,8 +14,6 @@ logger = logging.getLogger(__name__)
 COLLECTION_NAME = os.getenv("WEAVIATE_COLLECTION", "TestingData")
 
 _client: weaviate.WeaviateClient | None = None
-_agent: QueryAgent | None = None
-_agent_collection: str | None = None
 
 
 def get_client() -> weaviate.WeaviateClient:
@@ -67,13 +65,31 @@ def search_collection(
     limit: int = 30,
     alpha: float = 0.7,
     collection_name: str | None = None,
+    department: str | None = None,
+    level: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Hybrid search against the collection; returns plain dicts + score."""
+    """Hybrid search against the collection with optional department and level metadata filtering."""
     collection = get_collection(collection_name)
+
+    # Build dynamic metadata filters
+    filters = None
+    conditions = []
+
+    if department:
+        conditions.append(Filter.by_property("department").equal(department))
+    if level:
+        conditions.append(Filter.by_property("level").equal(level))
+
+    if len(conditions) == 1:
+        filters = conditions[0]
+    elif len(conditions) > 1:
+        filters = Filter.all_of(conditions)
+
     response = collection.query.hybrid(
         query=query,
         alpha=alpha,
         limit=limit,
+        filters=filters,
         return_metadata=MetadataQuery(score=True),
         return_properties=[
             "text",
@@ -82,6 +98,8 @@ def search_collection(
             "heading",
             "page",
             "chunk_id",
+            "department",
+            "level",
         ],
     )
 
@@ -94,37 +112,55 @@ def search_collection(
     return results
 
 
-def get_agent(collection_name: str | None = None) -> QueryAgent:
-    """Return a QueryAgent bound to the given collection (cached)."""
-    global _agent, _agent_collection
+def get_agent(
+    collection_name: str | None = None,
+    department: str | None = None,
+    level: str | None = None,
+) -> QueryAgent:
+    """Return a QueryAgent dynamically contextualized with user department and level context."""
     name = collection_name or COLLECTION_NAME
+    get_collection(name)  # validates collection exists
 
-    if _agent is None or _agent_collection != name:
-        get_collection(name)  # validates collection exists
-        _agent = QueryAgent(
-            client=get_client(),
-            collections=[name],
-            system_prompt=(
-                "You are a multi-course academic teaching assistant. "
-                "Answer using only the retrieved course material. "
-                "Identify the relevant course/subject from context; do not assume one course. "
-                "Be clear, accurate, and student-friendly. "
-                "Synthesize relevant sources. "
-                "Cite source, module_title, heading, and page when available. "
-                "Never invent facts, citations, or page numbers. "
-                "If the context is insufficient, say the answer is not in the provided materials. "
-                "If the question is ambiguous, ask for clarification."
-            ),
-        )
-        _agent_collection = name
-        logger.info(f"QueryAgent initialized for collection '{name}'")
+    # Build student profile context string
+    context_parts = []
+    if department:
+        context_parts.append(f"Department: {department}")
+    if level:
+        context_parts.append(f"Level: {level}")
 
-    return _agent
+    user_context = (
+        f" Student Profile: [{', '.join(context_parts)}]."
+        if context_parts
+        else ""
+    )
+
+    system_prompt = (
+        f'role:"You are a multi-course academic teaching assistant.{user_context} '
+        'Task:"Answer using only the retrieved course material. '
+        "Identify the relevant course/subject from context; do not assume one course. "
+        "Tailor explanations appropriately to the student's level and department context when relevant. "
+        "Be clear, accurate, and student-friendly. "
+        "Synthesize relevant sources. "
+        "Cite source, module_title, Lecturer Name, heading, Sub-heading, and page when available. "
+        "Never invent facts, citations, or page numbers. "
+        "If the context is insufficient, say the answer is not in the provided materials. "
+        'If the question is ambiguous, ask for clarification." '
+        'Keywords:"list relevant keywords from the question in your answer at the end of the response."'
+    )
+
+    # Instantiated per request to maintain specific system prompt context per student
+    agent = QueryAgent(
+        client=get_client(),
+        collections=[name],
+        system_prompt=system_prompt,
+    )
+    logger.info(f"QueryAgent initialized for collection '{name}' with context: {context_parts}")
+    return agent
 
 
 def close_client() -> None:
-    """Close the Weaviate client and clear cached agent."""
-    global _client, _agent, _agent_collection
+    """Close the Weaviate client."""
+    global _client
     if _client is not None:
         try:
             _client.close()
@@ -132,5 +168,3 @@ def close_client() -> None:
         except Exception as e:
             logger.warning(f"Error while closing Weaviate client: {e}")
         _client = None
-        _agent = None
-        _agent_collection = None
