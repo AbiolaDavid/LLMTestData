@@ -65,6 +65,8 @@ app.add_middleware(
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     pretty: bool = False
+    department: str | None = Field(None, description="User department context")
+    level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +90,12 @@ async def proxy_ask(req: AskRequest, request: Request):
         "Content-Type": "application/json",
         "X-API-Key": UPSTREAM_API_KEY,
     }
-    payload = {"question": req.question, "pretty": req.pretty}
+    payload = {
+        "question": req.question,
+        "pretty": req.pretty,
+        "department": req.department,
+        "level": req.level,
+    }
 
     try:
         r = await request.app.state.http.post(url, json=payload, headers=headers)
@@ -112,11 +119,27 @@ async def proxy_ask(req: AskRequest, request: Request):
 
 
 @app.get("/api/search")
-async def proxy_search(request: Request, q: str, limit: int = 8, alpha: float = 0.7):
-    """Optional: proxy the /search endpoint too."""
+async def proxy_search(
+    request: Request,
+    q: str,
+    limit: int = 8,
+    alpha: float = 0.7,
+    department: str | None = None,
+    level: str | None = None,
+):
+    """Proxy the /search endpoint, forwarding department and level filters."""
     url = f"{UPSTREAM_URL}/search"
     headers = {"X-API-Key": UPSTREAM_API_KEY}
-    params = {"q": q, "limit": limit, "alpha": alpha, "pretty": True}
+    params: dict[str, Any] = {
+        "q": q,
+        "limit": limit,
+        "alpha": alpha,
+        "pretty": True,
+    }
+    if department:
+        params["department"] = department
+    if level:
+        params["level"] = level
 
     try:
         r = await request.app.state.http.get(url, params=params, headers=headers)
