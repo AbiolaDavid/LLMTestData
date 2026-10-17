@@ -1,6 +1,16 @@
-fastapi>=0.110,<1.0
-uvicorn[standard]>=0.27
-pydantic>=2.6,<3
-python-dotenv>=1.0
-weaviate-client[agents]>=4.9,<5
-openai>=1.40
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+pydantic>=2.8.0
+python-dotenv>=1.0.0
+
+# Vector DB
+weaviate-client>=4.7.0
+
+# LLM clients (OpenAI-compatible Cohere endpoint)
+openai>=1.40.0
+
+# LangChain orchestration
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
