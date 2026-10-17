@@ -9,7 +9,7 @@
 
 import os
 import logging
-from typing import Any, Callable
+from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -77,9 +77,7 @@ def _is_internal_empty(x: dict[str, Any]) -> bool:
 
 def _safe(runnable: Runnable, fallback_message: str) -> Runnable:
     """Wrap a runnable so LLM/network failures don't break the whole request."""
-    return runnable.with_fallbacks(
-        [RunnableLambda(lambda _: fallback_message)]
-    )
+    return runnable.with_fallbacks([RunnableLambda(lambda _: fallback_message)])
 
 
 # ---------------------------------------------------------------------------
@@ -116,14 +114,26 @@ def build_dual_response_chain(
     )
 
     # ---- Retriever (wraps existing hybrid search, preserving alpha + filters) ----
+    # Wrapped in try/except so a Weaviate failure degrades to an empty result
+    # set (and the "not in provided materials" branch of the prompts) instead
+    # of surfacing as an opaque 500 from /ask.
     def _retrieve(inputs: dict[str, Any]) -> list[dict[str, Any]]:
-        return search_collection(
-            inputs["question"],
-            limit=limit,
-            alpha=alpha,
-            department=department,
-            level=level,
-        )
+        try:
+            return search_collection(
+                inputs["question"],
+                limit=limit,
+                alpha=alpha,
+                department=department,
+                level=level,
+            )
+        except Exception as e:
+            logger.error(
+                "Retrieval failed for question %r: %s",
+                inputs.get("question"),
+                e,
+                exc_info=True,
+            )
+            return []
 
     retriever = RunnableLambda(_retrieve)
 
@@ -154,7 +164,10 @@ def build_dual_response_chain(
                 "CRITICAL RULES: 1) DO NOT repeat the internal answer. "
                 "2) DO NOT cite internal sources. 3) Provide new, additive value only.",
             ),
-            ("human", "Original Question: {question}\n\nInternal Answer: {internal_answer}"),
+            (
+                "human",
+                "Original Question: {question}\n\nInternal Answer: {internal_answer}",
+            ),
         ]
     )
 
