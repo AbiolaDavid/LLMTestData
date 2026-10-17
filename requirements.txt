@@ -6,7 +6,7 @@ pydantic>=2.8.0
 python-dotenv>=1.0.0
 
 # Vector DB
-weaviate-client>=4.7.0
+weaviate-client[agents]>=4.7.0
 
 # LLM clients (OpenAI-compatible Cohere endpoint)
 openai>=1.40.0
