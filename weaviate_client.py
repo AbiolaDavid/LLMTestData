@@ -15,6 +15,22 @@ COLLECTION_NAME = os.getenv("WEAVIATE_COLLECTION", "TestingData")
 
 _client: weaviate.WeaviateClient | None = None
 
+# Cache of property names per collection so we never request or filter on
+# properties that don't exist in the schema (Weaviate raises on those and
+# previously surfaced as an opaque 500 from /ask).
+_PROPS_CACHE: dict[str, list[str]] = {}
+
+_WANTED_PROPS = [
+    "text",
+    "source",
+    "module_title",
+    "heading",
+    "page",
+    "chunk_id",
+    "department",
+    "level",
+]
+
 
 def get_client() -> weaviate.WeaviateClient:
     """Return a connected Weaviate Cloud client (singleton)."""
@@ -59,6 +75,15 @@ def get_collection(collection_name: str | None = None):
     return client.collections.get(name)
 
 
+def _available_props(collection, name: str) -> list[str]:
+    """Return the schema property names for the collection (cached)."""
+    if name not in _PROPS_CACHE:
+        cfg = collection.config.get()
+        _PROPS_CACHE[name] = [p.name for p in cfg.properties]
+        logger.info("Collection '%s' schema props: %s", name, _PROPS_CACHE[name])
+    return _PROPS_CACHE[name]
+
+
 def search_collection(
     query: str,
     *,
@@ -68,18 +93,37 @@ def search_collection(
     department: str | None = None,
     level: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Hybrid search against the collection with optional department and level metadata filtering."""
-    collection = get_collection(collection_name)
+    """Hybrid search with optional department / level filtering.
 
-    # Build dynamic metadata filters
-    filters = None
+    Only requests and filters on properties that actually exist in the
+    collection schema. Missing optional properties are logged and ignored
+    rather than raising — so a filter mismatch degrades to a warning, not
+    a 500.
+    """
+    name = collection_name or COLLECTION_NAME
+    collection = get_collection(name)
+
+    props = _available_props(collection, name)
+    return_props = [p for p in _WANTED_PROPS if p in props]
+
     conditions = []
-
     if department:
-        conditions.append(Filter.by_property("department").equal(department))
+        if "department" in props:
+            conditions.append(Filter.by_property("department").equal(department))
+        else:
+            logger.warning(
+                "Department filter '%s' ignored — 'department' not in schema",
+                department,
+            )
     if level:
-        conditions.append(Filter.by_property("level").equal(level))
+        if "level" in props:
+            conditions.append(Filter.by_property("level").equal(level))
+        else:
+            logger.warning(
+                "Level filter '%s' ignored — 'level' not in schema", level
+            )
 
+    filters = None
     if len(conditions) == 1:
         filters = conditions[0]
     elif len(conditions) > 1:
@@ -91,16 +135,7 @@ def search_collection(
         limit=limit,
         filters=filters,
         return_metadata=MetadataQuery(score=True),
-        return_properties=[
-            "text",
-            "source",
-            "module_title",
-            "heading",
-            "page",
-            "chunk_id",
-            "department",
-            "level",
-        ],
+        return_properties=return_props,
     )
 
     results: list[dict[str, Any]] = []
@@ -135,20 +170,20 @@ def get_agent(
     )
 
     system_prompt = (
-    f'Role: "You are an expert multi-course academic teaching assistant.\n{user_context}\n\n'
-    "Retrieval & Knowledge Base Guidelines:\n"
-    "1. Information Source: Answer queries exclusively using the retrieved knowledge base materials provided in the context. Do not draw on outside knowledge.\n"
-    "2. Multi-Course Context Awareness: Identify the correct course or subject from the context chunks dynamically; do not assume a single fixed course.\n"
-    "3. Contextual Retrieval & Synthesis: Carefully review all retrieved chunks, identify overlapping or complementary information across modules, and synthesize a coherent, student-friendly answer.\n"
-    "4. Handling Missing Information: If the retrieved knowledge base does not contain sufficient information to fully answer the question, state clearly: 'The answer to this question is not present in the provided materials.' Do not guess or extrapolate.\n"
-    "5. Clarification: If the user's question is ambiguous or vague, ask a brief clarifying question before attempting a detailed answer.\n\n"
-    "Output Formatting & Citation Rules:\n"
-    "- Professional Presentation: Deliver all responses in clean, professional, print-ready Markdown format. Use logical section headings (##, ###), concise bullet points, bold key terminology, and clean structural spacing for maximal readability.\n"
-    "- Target Audience: Tailor your explanations to match the student's department and academic level based on context metadata.\n"
-    "- In-Text Citations: Include precise citations directly following the statements they support using this exact format: [Course, Module Title, Lecturer Name, Heading > Sub-heading, Page X] (omit any fields not present in the metadata).\n"
-    "- Zero Hallucination Policy: Never invent, estimate, or hallucinate facts, references, lecturer names, or page numbers.\n"
-    "- Keywords Section: Conclude your response with a standalone section listing key concepts from the query and retrieved context: 'Keywords: [keyword1, keyword2, ...]'\""
-)
+        f'Role: "You are an expert multi-course academic teaching assistant.\n{user_context}\n\n'
+        "Retrieval & Knowledge Base Guidelines:\n"
+        "1. Information Source: Answer queries exclusively using the retrieved knowledge base materials provided in the context. Do not draw on outside knowledge.\n"
+        "2. Multi-Course Context Awareness: Identify the correct course or subject from the context chunks dynamically; do not assume a single fixed course.\n"
+        "3. Contextual Retrieval & Synthesis: Carefully review all retrieved chunks, identify overlapping or complementary information across modules, and synthesize a coherent, student-friendly answer.\n"
+        "4. Handling Missing Information: If the retrieved knowledge base does not contain sufficient information to fully answer the question, state clearly: 'The answer to this question is not present in the provided materials.' Do not guess or extrapolate.\n"
+        "5. Clarification: If the user's question is ambiguous or vague, ask a brief clarifying question before attempting a detailed answer.\n\n"
+        "Output Formatting & Citation Rules:\n"
+        "- Professional Presentation: Deliver all responses in clean, professional, print-ready Markdown format. Use logical section headings (##, ###), concise bullet points, bold key terminology, and clean structural spacing for maximal readability.\n"
+        "- Target Audience: Tailor your explanations to match the student's department and academic level based on context metadata.\n"
+        "- In-Text Citations: Include precise citations directly following the statements they support using this exact format: [Course, Module Title, Lecturer Name, Heading > Sub-heading, Page X] (omit any fields not present in the metadata).\n"
+        "- Zero Hallucination Policy: Never invent, estimate, or hallucinate facts, references, lecturer names, or page numbers.\n"
+        "- Keywords Section: Conclude your response with a standalone section listing key concepts from the query and retrieved context: 'Keywords: [keyword1, keyword2, ...]'\""
+    )
 
     # Instantiated per request to maintain specific system prompt context per student
     agent = QueryAgent(
@@ -156,7 +191,11 @@ def get_agent(
         collections=[name],
         system_prompt=system_prompt,
     )
-    logger.info(f"QueryAgent initialized for collection '{name}' with context: {context_parts}")
+    logger.info(
+        "QueryAgent initialized for collection '%s' with context: %s",
+        name,
+        context_parts,
+    )
     return agent
 
 
