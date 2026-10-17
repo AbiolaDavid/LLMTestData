@@ -32,6 +32,10 @@ API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY environment variable is required")
 
+# When set to "1", /ask and /search surface the actual exception in the HTTP
+# 500 body. Useful while debugging; never enable in production.
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS") == "1"
+
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv("ALLOWED_ORIGINS", "").split(",")
@@ -113,7 +117,7 @@ class SourceItem(BaseModel):
     source: str | None = None
     module_title: str | None = None
     heading: str | None = None
-    page: int | None = None
+    page: int | str | None = None  # tolerate "Page 12" / "12" / 12
     chunk_id: str | None = None
     score: float | None = None
     citation: str | None = None
@@ -130,6 +134,16 @@ class SearchResponse(BaseModel):
     collection: str
     results: list[SourceItem]
     results_pretty: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _error_detail(exc: Exception, default: str) -> str:
+    """Return a detailed error message only when DEBUG_ERRORS=1."""
+    if DEBUG_ERRORS:
+        return f"{type(exc).__name__}: {exc}"
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +186,9 @@ def ask_question(req: AskRequest):
         logger.error("Chain invocation error: %s", e, exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="An internal error occurred while generating the answer.",
+            detail=_error_detail(
+                e, "An internal error occurred while generating the answer."
+            ),
         )
 
     internal_answer = result.get("internal_answer", "")
@@ -240,7 +256,7 @@ def search(
         logger.error("Search error: %s", e, exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail="An internal error occurred while searching.",
+            detail=_error_detail(e, "An internal error occurred while searching."),
         )
 
     results: list[SourceItem] = []
