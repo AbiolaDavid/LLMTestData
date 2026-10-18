@@ -6,7 +6,7 @@ services:
     name: weaviate-query-api
     runtime: python
     plan: free
-    region: oregon
+    region: frankfurt
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
@@ -39,7 +39,7 @@ services:
     name: abiola-proxy
     runtime: python
     plan: free
-    region: oregon
+    region: frankfurt
     buildCommand: pip install --upgrade pip && pip install -r proxy-requirements.txt
     startCommand: uvicorn proxy:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
