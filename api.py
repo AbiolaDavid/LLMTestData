@@ -72,9 +72,9 @@ async def lifespan(app: FastAPI):
 # App & middleware
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="FULafia RAG API",
+    title="Federal University of Lafia (FULafia) AI RAG API",
     description=(
-        "Welcome to FULafia's RAG API. LangChain-orchestrated dual-response "
+        "Welcome to Federal University of Lafia (FULafia) AI RAG API. LangChain-orchestrated dual-response "
         "pipeline combining internal Weaviate retrieval with external Cohere expansion."
     ),
     lifespan=lifespan,
@@ -151,7 +151,7 @@ def _error_detail(exc: Exception, default: str) -> str:
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Fulafia AI RAG API", "orchestrator": "langchain"}
+    return {"status": "ok", "service": "Federal University of Lafia (FULafia) AI RAG API System", "orchestrator": "langchain"}
 
 
 @app.get("/healthz")
