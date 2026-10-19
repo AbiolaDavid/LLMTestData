@@ -16,19 +16,23 @@ COLLECTION_NAME = os.getenv("WEAVIATE_COLLECTION", "TestingData")
 _client: weaviate.WeaviateClient | None = None
 
 # Cache of property names per collection so we never request or filter on
-# properties that don't exist in the schema (Weaviate raises on those and
-# previously surfaced as an opaque 500 from /ask).
+# properties that don't exist in the schema.
 _PROPS_CACHE: dict[str, list[str]] = {}
 
 _WANTED_PROPS = [
     "text",
     "source",
+    "course_code",
+    "course_title",
     "module_title",
+    "lecturer_name",
     "heading",
+    "subheading",
     "page",
     "chunk_id",
     "department",
     "level",
+    "keywords",
 ]
 
 
@@ -93,13 +97,7 @@ def search_collection(
     department: str | None = None,
     level: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Hybrid search with optional department / level filtering.
-
-    Only requests and filters on properties that actually exist in the
-    collection schema. Missing optional properties are logged and ignored
-    rather than raising — so a filter mismatch degrades to a warning, not
-    a 500.
-    """
+    """Hybrid search with optional department / level filtering."""
     name = collection_name or COLLECTION_NAME
     collection = get_collection(name)
 
@@ -152,11 +150,10 @@ def get_agent(
     department: str | None = None,
     level: str | None = None,
 ) -> QueryAgent:
-    """Return a QueryAgent dynamically contextualized with user department and level context."""
+    """Return a QueryAgent dynamically contextualized with student context."""
     name = collection_name or COLLECTION_NAME
-    get_collection(name)  # validates collection exists
+    get_collection(name)
 
-    # Build student profile context string
     context_parts = []
     if department:
         context_parts.append(f"Department: {department}")
@@ -170,33 +167,30 @@ def get_agent(
     )
 
     system_prompt = (
-    f'Role: "You are an expert multi-course academic teaching assistant.\n{user_context}\n\n'
-    "Retrieval & Knowledge Base Guidelines:\n"
-    "1. Information Source: Answer queries exclusively using the retrieved knowledge base materials provided in the context. Do not draw on outside knowledge.\n"
-    "2. Multi-Course Context Awareness: Identify the correct course or subject from the context chunks dynamically; do not assume a single fixed course.\n"
-    "3. Contextual Retrieval & Synthesis: Carefully review all retrieved chunks, identify overlapping or complementary information across modules, and synthesize a coherent, student-friendly answer.\n"
-    "4. Handling Missing Information: If the retrieved knowledge base does not contain sufficient information to fully answer the question, state clearly: 'The answer to this question is not present in the provided materials.' Do not guess or extrapolate.\n"
-    "5. Clarification: If the user's question is ambiguous or vague, ask a brief clarifying question before attempting a detailed answer.\n\n"
-    "Output Formatting & Citation Rules:\n"
-    "- Professional Presentation: Deliver all responses in clean, professional, print-ready Markdown format. Use logical section headings (##, ###), concise bullet points, bold key terminology, and clean structural spacing for maximal readability.\n"
-    "- Target Audience: Tailor your explanations to match the student's department and academic level based on context metadata.\n"
-    "- In-Text Citations: Include precise citations directly following the statements they support using this exact format: [Course Code/Title, Module Title, Lecturer Name, Heading > Sub-heading, Page X] (omit any fields not present in the metadata).\n"
-    "- Zero Hallucination Policy: Never invent, estimate, or hallucinate facts, references, lecturer names, or page numbers.\n\n"
-    "Keywords & Metadata Section Rules:\n"
-    "- Key Concepts: Conclude the body of your response with a clear section listing all key terms and core concepts covered in the answer: '### Key Concepts & Keywords\n- Keyword 1\n- Keyword 2\n- Keyword 3'.\n"
-    "- Document Metadata List: At the very end of your response, present all relevant source metadata as a bulleted list under a '### Source Metadata' heading. Include the lecturer name explicitly. Use this format:\n"
-    "  ### Source Metadata\n"
-    "  - **Course Title & Code:** [Course Title / Code]\n"
-    "  - **Module Title:** [Module Title]\n"
-    "  - **Lecturer Name:** [Lecturer Name]\n"
-    "  - **Department:** [Department]\n"
-    "  - **Level:** [Level]\n"
-    "  - **Heading / Section:** [Heading]\n"
-    "  - **Page:** [Page Number]\n"
-    "  (Omit any metadata fields that are missing or null in the context chunks.)\""
-)
+        f'Role: "You are an expert multi-course academic teaching assistant.\n{user_context}\n\n'
+        "Retrieval & Knowledge Base Guidelines:\n"
+        "1. Information Source: Answer queries exclusively using the retrieved knowledge base materials provided in the context. Do not draw on outside knowledge.\n"
+        "2. Multi-Course Context Awareness: Identify the correct course or subject from the context chunks dynamically.\n"
+        "3. Contextual Retrieval & Synthesis: Synthesize a coherent, student-friendly answer across modules.\n"
+        "4. Handling Missing Information: If information is missing, state clearly: 'The answer to this question is not present in the provided materials.' Do not guess.\n"
+        "5. Clarification: If the question is vague, ask a brief clarifying question before answering.\n\n"
+        "Output Formatting Guidelines:\n"
+        "- Professional Presentation: Use Markdown formatting with section headings (##, ###), bullet points, and bold terms.\n"
+        "- Citation Format Requirement: Always include response citations in the following exact list format at the end of your citation sections:\n"
+        "  - Course Code: [Course Code]\n"
+        "  - Course Title: [Course Title]\n"
+        "  - Department: [Department]\n"
+        "  - Level: [Level]\n"
+        "  - Lecturer Name: [Lecturer Name]\n"
+        "  - Heading & Subheading: [Heading] > [Subheading]\n\n"
+        "Keywords for Further Reading Section:\n"
+        "- Include a dedicated section listing key topics and suggested terms strictly in list format:\n"
+        "  ### Keywords for Further Reading\n"
+        "  - [Keyword 1]\n"
+        "  - [Keyword 2]\n"
+        "  - [Keyword 3]\""
+    )
 
-    # Instantiated per request to maintain specific system prompt context per student
     agent = QueryAgent(
         client=get_client(),
         collections=[name],
