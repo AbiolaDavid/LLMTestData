@@ -123,10 +123,16 @@ class SourceItem(BaseModel):
     citation: str | None = None
 
 
+class ResponseMetadata(BaseModel):
+    department: str | None = Field(None, description="User department context")
+    level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
+
+
 class AskResponse(BaseModel):
     answer: str
     answer_pretty: str | None = None
     sources: list[SourceItem]
+    metadata: ResponseMetadata | None = None
 
 
 class SearchResponse(BaseModel):
@@ -134,6 +140,7 @@ class SearchResponse(BaseModel):
     collection: str
     results: list[SourceItem]
     results_pretty: str | None = None
+    metadata: ResponseMetadata | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +224,11 @@ def ask_question(req: AskRequest):
         f"**External Source:**\n{external_answer}"
     )
 
+    response_meta = ResponseMetadata(
+        department=req.department,
+        level=req.level,
+    )
+
     if req.pretty:
         pretty_internal = format_answer(internal_answer, sources, include_sources=True)
         pretty_dual_response = (
@@ -228,9 +240,14 @@ def ask_question(req: AskRequest):
             answer=final_dual_response,
             answer_pretty=pretty_dual_response,
             sources=sources,
+            metadata=response_meta,
         )
 
-    return AskResponse(answer=final_dual_response, sources=sources)
+    return AskResponse(
+        answer=final_dual_response,
+        sources=sources,
+        metadata=response_meta,
+    )
 
 
 @app.get("/search", response_model=SearchResponse, dependencies=[Depends(verify_api_key)])
@@ -274,9 +291,14 @@ def search(
         results.append(item)
 
     pretty_block = format_search_results(hits) if pretty else None
+    response_meta = ResponseMetadata(
+        department=department,
+        level=level,
+    )
     return SearchResponse(
         query=q,
         collection=COLLECTION_NAME,
         results=results,
         results_pretty=pretty_block,
+        metadata=response_meta,
     )
