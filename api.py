@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 from weaviate_client import (
     search_collection,
     close_client,
+    debug_schema,
+    debug_search,
     COLLECTION_NAME,
 )
 from formatter import format_answer, format_search_results, format_source
@@ -44,7 +46,9 @@ def _llm_startup_check() -> None:
         return
     try:
         llm.invoke("ping")
-        logger.info("LangChain LLM OK (model=%s, base=%s)", COHERE_MODEL, COHERE_BASE_URL)
+        logger.info(
+            "LangChain LLM OK (model=%s, base=%s)", COHERE_MODEL, COHERE_BASE_URL
+        )
     except Exception as e:
         logger.error("LLM startup check failed: %s", e, exc_info=True)
 
@@ -59,8 +63,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Federal University of Lafia (FULafia) AI RAG API",
     description=(
-        "Welcome to Federal University of Lafia (FULafia) AI RAG API. LangChain-orchestrated dual-response "
-        "pipeline combining internal Weaviate retrieval with external Cohere expansion."
+        "Welcome to Federal University of Lafia (FULafia) AI RAG API. "
+        "LangChain-orchestrated dual-response pipeline combining internal "
+        "Weaviate retrieval with external Cohere expansion."
     ),
     lifespan=lifespan,
 )
@@ -88,7 +93,14 @@ class AskRequest(BaseModel):
     )
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
     department: str | None = Field(None, description="User department context")
-    level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
+    level: str | None = Field(
+        None, description="User level context (e.g. 100, 200, 300)"
+    )
+    min_score: float | None = Field(
+        None,
+        ge=0.0,
+        description="Optional minimum hybrid score; below this hits are dropped",
+    )
 
 
 class SourceItem(BaseModel):
@@ -112,7 +124,9 @@ class SourceItem(BaseModel):
 
 class ResponseMetadata(BaseModel):
     department: str | None = Field(None, description="User department context")
-    level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
+    level: str | None = Field(
+        None, description="User level context (e.g. 100, 200, 300)"
+    )
 
 
 class AskResponse(BaseModel):
@@ -138,7 +152,7 @@ def _error_detail(exc: Exception, default: str) -> str:
 
 
 def _build_list_citation(doc: dict) -> list[str]:
-    """Build source citation strictly formatted as a list with metadata placeholders."""
+    """Build source citation strictly formatted as a list with metadata."""
     heading = doc.get("heading") or ""
     subheading = doc.get("subheading") or ""
     heading_and_subheading = (
@@ -179,14 +193,58 @@ def healthz():
     }
 
 
+# ---------------------------------------------------------------------------
+# Debug endpoints — protect with API key like everything else
+# ---------------------------------------------------------------------------
+@app.get("/debug/schema", dependencies=[Depends(verify_api_key)])
+def debug_schema_endpoint():
+    """Return collection schema so you can confirm which property holds text."""
+    try:
+        return debug_schema()
+    except Exception as e:
+        logger.error("Schema debug error: %s", e, exc_info=True)
+        raise HTTPException(500, _error_detail(e, "Unable to read schema"))
+
+
+@app.get("/debug/search", dependencies=[Depends(verify_api_key)])
+def debug_search_endpoint(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(3, ge=1, le=20),
+    alpha: float = Query(0.5, ge=0.0, le=1.0),
+    department: str | None = Query(None),
+    level: str | None = Query(None),
+):
+    """Raw hybrid search returning ALL properties so you can verify text is
+    actually present in retrieved docs before blaming the LLM."""
+    try:
+        return debug_search(
+            q,
+            limit=limit,
+            alpha=alpha,
+            department=department,
+            level=level,
+        )
+    except Exception as e:
+        logger.error("Search debug error: %s", e, exc_info=True)
+        raise HTTPException(500, _error_detail(e, "Unable to run debug search"))
+
+
+# ---------------------------------------------------------------------------
+# Main endpoints
+# ---------------------------------------------------------------------------
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
 def ask_question(req: AskRequest):
     try:
         chain = build_dual_response_chain(
             department=req.department,
             level=req.level,
+            min_score=req.min_score,
         )
         result = chain.invoke({"question": req.question})
+    except ValueError as e:
+        # Filter referenced a property that isn't in the schema.
+        logger.warning("Request rejected: %s", e)
+        raise HTTPException(400, str(e))
     except Exception as e:
         logger.error("Chain invocation error: %s", e, exc_info=True)
         raise HTTPException(
@@ -283,19 +341,30 @@ def search(
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     limit: int = Query(8, ge=1, le=30, description="Max number of chunks to return"),
     alpha: float = Query(
-        0.7,
+        0.5,
         ge=0.0,
         le=1.0,
         description="Hybrid search balance (0=BM25 only, 1=vector only)",
     ),
     department: str | None = Query(None, description="Department metadata filter"),
     level: str | None = Query(None, description="Level metadata filter"),
+    min_score: float | None = Query(
+        None, ge=0.0, description="Drop hits with a hybrid score below this value"
+    ),
     pretty: bool = Query(True, description="Also return a human-readable block"),
 ):
     try:
         hits = search_collection(
-            q, limit=limit, alpha=alpha, department=department, level=level
+            q,
+            limit=limit,
+            alpha=alpha,
+            department=department,
+            level=level,
+            min_score=min_score,
         )
+    except ValueError as e:
+        logger.warning("Search request rejected: %s", e)
+        raise HTTPException(400, str(e))
     except Exception as e:
         logger.error("Search error: %s", e, exc_info=True)
         raise HTTPException(
