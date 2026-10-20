@@ -152,14 +152,24 @@ def _error_detail(exc: Exception, default: str) -> str:
 
 
 def _build_list_citation(doc: dict) -> list[str]:
-    """Build source citation strictly formatted as a list with metadata."""
+    """Build source citation strictly formatted as a list with metadata.
+
+    Includes page number so the full retrieval provenance (course, dept,
+    level, lecturer, heading/subheading, page) travels with every source.
+    Tolerates alternate ingestion field names (page / page_num).
+    """
     heading = doc.get("heading") or ""
     subheading = doc.get("subheading") or ""
     heading_and_subheading = (
         f"{heading} > {subheading}".strip(" >")
         if heading or subheading
-        else doc.get("heading_and_subheading", "N/A")
+        else (doc.get("heading_and_subheading") or "N/A")
     )
+
+    page = doc.get("page")
+    if page is None:
+        page = doc.get("page_num")
+    page_display = page if page not in (None, "") else "N/A"
 
     return [
         f"- Course Code: {doc.get('course_code') or 'N/A'}",
@@ -168,7 +178,28 @@ def _build_list_citation(doc: dict) -> list[str]:
         f"- Level: {doc.get('level') or 'N/A'}",
         f"- Lecturer Name: {doc.get('lecturer_name') or 'N/A'}",
         f"- Heading & Subheading: {heading_and_subheading}",
+        f"- Page: {page_display}",
     ]
+
+
+def _format_citations_block(sources: list["SourceItem"]) -> str:
+    """Render a Markdown citation block from the SourceItem list.
+
+    This is the single source of truth for citations in the response text.
+    Returns an empty string when there are no sources so the response
+    degrades gracefully.
+    """
+    if not sources:
+        return ""
+
+    blocks: list[str] = []
+    for i, s in enumerate(sources, 1):
+        citation = s.citation or []
+        if isinstance(citation, str):
+            citation = [citation]
+        blocks.append(f"**[Source {i}]**\n" + "\n".join(citation))
+
+    return "\n\n### Citations / Source Metadata\n\n" + "\n\n".join(blocks)
 
 
 @app.get("/")
@@ -268,6 +299,11 @@ def ask_question(req: AskRequest):
             f"{heading} > {subheading}".strip(" >") if heading or subheading else None
         )
 
+        # Tolerate alternate ingestion field names for page.
+        page_val = d.get("page")
+        if page_val is None:
+            page_val = d.get("page_num")
+
         item = SourceItem(
             text=d.get("text"),
             source=d.get("source"),
@@ -280,7 +316,7 @@ def ask_question(req: AskRequest):
             heading=heading or None,
             subheading=subheading or None,
             heading_and_subheading=combined_heading,
-            page=d.get("page"),
+            page=page_val,
             chunk_id=d.get("chunk_id"),
             score=d.get("score"),
             keywords=d.get("keywords") if isinstance(d.get("keywords"), list) else [],
@@ -300,8 +336,12 @@ def ask_question(req: AskRequest):
         else ""
     )
 
+    # Single source of truth for citations in the answer text.
+    citations_block = _format_citations_block(sources)
+
     final_dual_response = (
-        f"**Internal Response:**\n{internal_answer}\n\n"
+        f"**Internal Response:**\n{internal_answer}"
+        f"{citations_block}\n\n"
         f"---\n\n"
         f"**External Source:**\n{external_answer}"
         f"{keywords_formatted_block}"
@@ -313,9 +353,14 @@ def ask_question(req: AskRequest):
     )
 
     if req.pretty:
-        pretty_internal = format_answer(internal_answer, sources, include_sources=True)
+        # include_sources=False — citations are rendered once via citations_block
+        # so there is no duplication and no divergence between pretty/non-pretty.
+        pretty_internal = format_answer(
+            internal_answer, sources, include_sources=False
+        )
         pretty_dual_response = (
-            f"{pretty_internal}\n\n"
+            f"{pretty_internal}"
+            f"{citations_block}\n\n"
             f"---\n\n"
             f"**External Source:**\n{external_answer}"
             f"{keywords_formatted_block}"
@@ -380,6 +425,10 @@ def search(
             f"{heading} > {subheading}".strip(" >") if heading or subheading else None
         )
 
+        page_val = h.get("page")
+        if page_val is None:
+            page_val = h.get("page_num")
+
         item = SourceItem(
             text=h.get("text"),
             source=h.get("source"),
@@ -392,7 +441,7 @@ def search(
             heading=heading or None,
             subheading=subheading or None,
             heading_and_subheading=combined_heading,
-            page=h.get("page"),
+            page=page_val,
             chunk_id=h.get("chunk_id"),
             score=h.get("score"),
             keywords=h.get("keywords") if isinstance(h.get("keywords"), list) else [],
