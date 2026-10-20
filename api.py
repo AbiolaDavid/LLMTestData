@@ -138,7 +138,7 @@ def _error_detail(exc: Exception, default: str) -> str:
 
 
 def _build_list_citation(doc: dict) -> list[str]:
-    """Build source citation formatted as a list."""
+    """Build source citation strictly formatted as a list with metadata placeholders."""
     heading = doc.get("heading") or ""
     subheading = doc.get("subheading") or ""
     heading_and_subheading = (
@@ -148,18 +148,22 @@ def _build_list_citation(doc: dict) -> list[str]:
     )
 
     return [
-        f"Course code: {doc.get('course_code') or 'N/A'}",
-        f"Course Title: {doc.get('course_title') or doc.get('module_title') or 'N/A'}",
-        f"Department: {doc.get('department') or 'N/A'}",
-        f"Level: {doc.get('level') or 'N/A'}",
-        f"Lecturer Name: {doc.get('lecturer_name') or 'N/A'}",
-        f"Heading & Subheading: {heading_and_subheading}",
+        f"- Course Code: {doc.get('course_code') or 'N/A'}",
+        f"- Course Title: {doc.get('course_title') or doc.get('module_title') or 'N/A'}",
+        f"- Department: {doc.get('department') or 'N/A'}",
+        f"- Level: {doc.get('level') or 'N/A'}",
+        f"- Lecturer Name: {doc.get('lecturer_name') or 'N/A'}",
+        f"- Heading & Subheading: {heading_and_subheading}",
     ]
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Federal University of Lafia (FULafia) AI RAG API System", "orchestrator": "langchain"}
+    return {
+        "status": "ok",
+        "service": "Federal University of Lafia (FULafia) AI RAG API System",
+        "orchestrator": "langchain",
+    }
 
 
 @app.get("/healthz")
@@ -230,10 +234,19 @@ def ask_question(req: AskRequest):
         if isinstance(d.get("keywords"), list):
             extracted_keywords.update(d.get("keywords"))
 
+    keywords_list = list(extracted_keywords)
+    keywords_formatted_block = (
+        "\n\n### Keywords for Further Reading\n"
+        + "\n".join(f"- {kw}" for kw in keywords_list)
+        if keywords_list
+        else ""
+    )
+
     final_dual_response = (
         f"**Internal Response:**\n{internal_answer}\n\n"
         f"---\n\n"
         f"**External Source:**\n{external_answer}"
+        f"{keywords_formatted_block}"
     )
 
     response_meta = ResponseMetadata(
@@ -241,14 +254,13 @@ def ask_question(req: AskRequest):
         level=req.level,
     )
 
-    keywords_list = list(extracted_keywords)
-
     if req.pretty:
         pretty_internal = format_answer(internal_answer, sources, include_sources=True)
         pretty_dual_response = (
             f"{pretty_internal}\n\n"
             f"---\n\n"
             f"**External Source:**\n{external_answer}"
+            f"{keywords_formatted_block}"
         )
         return AskResponse(
             answer=final_dual_response,
