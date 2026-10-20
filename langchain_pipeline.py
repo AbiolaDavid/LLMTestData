@@ -1,11 +1,5 @@
 # langchain_pipeline.py
 # LangChain LCEL orchestration for ABIOLA AI RAG pipeline.
-#
-# Responsibilities:
-#   - Wrap Weaviate hybrid retrieval (search_collection) as a Runnable
-#   - Build the dual-response chain: internal (grounded) + external (Cohere)
-#   - Preserve student department/level context in prompts
-#   - Gracefully degrade when the LLM is unavailable
 
 import os
 import logging
@@ -25,9 +19,6 @@ from weaviate_client import search_collection
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration (mirrors api.py env vars)
-# ---------------------------------------------------------------------------
 COHERE_API_KEY = (os.environ.get("COHERE_API_KEY") or "").strip()
 COHERE_BASE_URL = os.environ.get(
     "COHERE_BASE_URL", "https://api.cohere.ai/compatibility/v1"
@@ -53,20 +44,28 @@ def get_llm() -> ChatOpenAI | None:
     return _llm
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _format_docs(docs: list[dict[str, Any]]) -> str:
     if not docs:
         return "(no relevant documents found)"
     parts = []
     for i, d in enumerate(docs, 1):
+        heading = d.get("heading") or ""
+        subheading = d.get("subheading") or ""
+        combined_heading = (
+            f"{heading} > {subheading}".strip(" >")
+            if heading or subheading
+            else d.get("heading_and_subheading", "N/A")
+        )
+
         parts.append(
-            f"[{i}] Source: {d.get('source', '?')} | "
-            f"Module: {d.get('module_title', '?')} | "
-            f"Heading: {d.get('heading', '?')} | "
-            f"Page: {d.get('page', '?')}\n"
-            f"{d.get('text', '')}"
+            f"[{i}] Course Code: {d.get('course_code', 'N/A')} | "
+            f"Course Title: {d.get('course_title') or d.get('module_title', 'N/A')} | "
+            f"Department: {d.get('department', 'N/A')} | "
+            f"Level: {d.get('level', 'N/A')} | "
+            f"Lecturer: {d.get('lecturer_name', 'N/A')} | "
+            f"Heading & Subheading: {combined_heading} | "
+            f"Page: {d.get('page', 'N/A')}\n"
+            f"Text: {d.get('text', '')}"
         )
     return "\n\n".join(parts)
 
@@ -80,30 +79,15 @@ def _safe(runnable: Runnable, fallback_message: str) -> Runnable:
     return runnable.with_fallbacks([RunnableLambda(lambda _: fallback_message)])
 
 
-# ---------------------------------------------------------------------------
-# Chain factory
-# ---------------------------------------------------------------------------
 def build_dual_response_chain(
     department: str | None = None,
     level: str | None = None,
     limit: int = 8,
     alpha: float = 0.7,
 ) -> Runnable:
-    """
-    Build a per-request LCEL chain.
-
-    Input:  {"question": str}
-    Output: {
-        "question": str,
-        "docs": list[dict],        # raw Weaviate hits (for source citations)
-        "context": str,
-        "internal_answer": str,
-        "external_answer": str,
-    }
-    """
+    """Build a per-request LCEL chain with explicit metadata and keyword placeholders."""
     llm = get_llm()
 
-    # ---- Student profile context for prompts ----
     context_parts: list[str] = []
     if department:
         context_parts.append(f"Department: {department}")
@@ -113,10 +97,6 @@ def build_dual_response_chain(
         f" Student Profile: [{', '.join(context_parts)}]." if context_parts else ""
     )
 
-    # ---- Retriever (wraps existing hybrid search, preserving alpha + filters) ----
-    # Wrapped in try/except so a Weaviate failure degrades to an empty result
-    # set (and the "not in provided materials" branch of the prompts) instead
-    # of surfacing as an opaque 500 from /ask.
     def _retrieve(inputs: dict[str, Any]) -> list[dict[str, Any]]:
         try:
             return search_collection(
@@ -137,18 +117,28 @@ def build_dual_response_chain(
 
     retriever = RunnableLambda(_retrieve)
 
-    # ---- Prompts ----
+    # System prompt integrating metadata placeholders and list-formatted keywords
     internal_prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                f"You are a multi-course academic teaching assistant.{student_context} "
-                "Answer using only the retrieved course material. "
-                "Identify the relevant course/subject from context; do not assume one course. "
-                "Tailor explanations to the student's level and department. "
-                "Cite source, module_title, heading, and page when available. "
-                "Never invent facts, citations, or page numbers. "
-                "If the context is insufficient, say the answer is not in the provided materials.",
+                f"You are a multi-course academic teaching assistant.{student_context}\n\n"
+                "INSTRUCTIONS:\n"
+                "1. Answer using ONLY the retrieved course materials. Do not draw on external knowledge.\n"
+                "2. Identify the relevant course or subject dynamically.\n"
+                "3. If the answer is missing, state clearly: 'The answer to this question is not present in the provided materials.'\n"
+                "4. Always include metadata citations directly in your response in list format as follows:\n"
+                "   - Course Code: {{course_code}}\n"
+                "   - Course Title: {{course_title}}\n"
+                "   - Department: {{department}}\n"
+                "   - Level: {{level}}\n"
+                "   - Lecturer Name: {{lecturer_name}}\n"
+                "   - Heading & Subheading: {{heading_and_subheading}}\n\n"
+                "5. Always end your response with a dedicated section listing relevant keywords strictly in list format:\n"
+                "   ### Keywords for Further Reading\n"
+                "   - {{keyword_1}}\n"
+                "   - {{keyword_2}}\n"
+                "   - {{keyword_3}}",
             ),
             ("human", "Retrieved Materials:\n{context}\n\nQuestion: {question}"),
         ]
@@ -158,11 +148,18 @@ def build_dual_response_chain(
         [
             (
                 "system",
-                f"You are an expert academic supplement.{student_context} "
+                f"You are an expert academic supplement.{student_context}\n"
                 "An internal knowledge base provided a grounded answer. "
-                "Provide a related, broader, or complementary perspective. "
-                "CRITICAL RULES: 1) DO NOT repeat the internal answer. "
-                "2) DO NOT cite internal sources. 3) Provide new, additive value only.",
+                "Provide a related, broader, or complementary perspective.\n"
+                "CRITICAL RULES:\n"
+                "1) DO NOT repeat the internal answer.\n"
+                "2) DO NOT cite internal sources.\n"
+                "3) Provide new, additive value only.\n"
+                "4) Include relevant keywords for further reading strictly in list format at the end:\n"
+                "   ### Keywords for Further Reading\n"
+                "   - {{keyword_1}}\n"
+                "   - {{keyword_2}}\n"
+                "   - {{keyword_3}}",
             ),
             (
                 "human",
@@ -175,15 +172,19 @@ def build_dual_response_chain(
         [
             (
                 "system",
-                f"You are an expert academic assistant.{student_context} "
+                f"You are an expert academic assistant.{student_context}\n"
                 "The internal knowledge base could not find an answer. "
-                "Provide a comprehensive, well-structured answer based on pre-trained knowledge.",
+                "Provide a comprehensive, well-structured answer based on pre-trained knowledge.\n"
+                "Always include relevant keywords for further reading strictly in list format at the end:\n"
+                "### Keywords for Further Reading\n"
+                "- {{keyword_1}}\n"
+                "- {{keyword_2}}\n"
+                "- {{keyword_3}}",
             ),
             ("human", "Original Question: {question}"),
         ]
     )
 
-    # ---- Internal step ----
     if llm is None:
         internal_generate: Runnable = RunnableLambda(
             lambda _: "Internal answer generation is currently unavailable."
@@ -203,7 +204,6 @@ def build_dual_response_chain(
         context=RunnableLambda(lambda x: _format_docs(x["docs"]))
     ) | RunnablePassthrough.assign(internal_answer=internal_generate)
 
-    # ---- External step ----
     if llm is None:
         external_step = RunnablePassthrough.assign(
             external_answer=RunnableLambda(
@@ -239,7 +239,6 @@ def build_dual_response_chain(
 
         external_step = RunnablePassthrough.assign(external_answer=external_generate)
 
-    # ---- Full chain ----
     return (
         RunnablePassthrough.assign(docs=retriever)
         | internal_step
