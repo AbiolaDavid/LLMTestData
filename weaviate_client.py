@@ -145,6 +145,8 @@ def search_collection(
     return results
 
 
+# snippet for weaviate_client.py inside get_agent()
+
 def get_agent(
     collection_name: str | None = None,
     department: str | None = None,
@@ -176,19 +178,19 @@ def get_agent(
         "5. Clarification: If the question is vague, ask a brief clarifying question before answering.\n\n"
         "Output Formatting Guidelines:\n"
         "- Professional Presentation: Use Markdown formatting with section headings (##, ###), bullet points, and bold terms.\n"
-        "- Citation Format Requirement: Always include response citations in the following exact list format at the end of your citation sections:\n"
-        "  - Course Code: [Course Code]\n"
-        "  - Course Title: [Course Title]\n"
-        "  - Department: [Department]\n"
-        "  - Level: [Level]\n"
-        "  - Lecturer Name: [Lecturer Name]\n"
-        "  - Heading & Subheading: [Heading] > [Subheading]\n\n"
+        "- Citation Format Requirement: ALWAYS include response citations in the following exact list format using the metadata placeholders:\n"
+        "  - Course Code: {course_code}\n"
+        "  - Course Title: {course_title}\n"
+        "  - Department: {department}\n"
+        "  - Level: {level}\n"
+        "  - Lecturer Name: {lecturer_name}\n"
+        "  - Heading & Subheading: {heading_and_subheading}\n\n"
         "Keywords for Further Reading Section:\n"
-        "- Include a dedicated section listing key topics and suggested terms strictly in list format:\n"
+        "- ALWAYS include a dedicated section at the end of the response listing relevant key topics and suggested terms strictly in list format:\n"
         "  ### Keywords for Further Reading\n"
-        "  - [Keyword 1]\n"
-        "  - [Keyword 2]\n"
-        "  - [Keyword 3]\""
+        "  - {keyword_1}\n"
+        "  - {keyword_2}\n"
+        "  - {keyword_3}\""
     )
 
     agent = QueryAgent(
@@ -202,7 +204,6 @@ def get_agent(
         context_parts,
     )
     return agent
-
 
 def close_client() -> None:
     """Close the Weaviate client."""
