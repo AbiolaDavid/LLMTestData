@@ -151,13 +151,12 @@ def _error_detail(exc: Exception, default: str) -> str:
     return default
 
 
+# ---------------------------------------------------------------------------
+# Citation building
+# ---------------------------------------------------------------------------
 def _build_list_citation(doc: dict) -> list[str]:
-    """Build source citation strictly formatted as a list with metadata.
-
-    Includes page number so the full retrieval provenance (course, dept,
-    level, lecturer, heading/subheading, page) travels with every source.
-    Tolerates alternate ingestion field names (page / page_num).
-    """
+    """Build a per-chunk citation list (used as the source of truth that
+    the /search endpoint returns per result)."""
     heading = doc.get("heading") or ""
     subheading = doc.get("subheading") or ""
     heading_and_subheading = (
@@ -182,26 +181,147 @@ def _build_list_citation(doc: dict) -> list[str]:
     ]
 
 
-def _format_citations_block(sources: list["SourceItem"]) -> str:
-    """Render a Markdown citation block from the SourceItem list.
+def _unique_strs(values) -> list[str]:
+    """Ordered unique list of non-empty stripped strings."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
-    This is the single source of truth for citations in the response text.
-    Returns an empty string when there are no sources so the response
-    degrades gracefully.
+
+def _page_sort_key(p: str):
+    try:
+        return (0, int(p))
+    except (TypeError, ValueError):
+        return (1, p)
+
+
+def _consolidate_sources(sources: list["SourceItem"]) -> list["SourceItem"]:
+    """Collapse all retrieved chunks into ONE consolidated source entry.
+
+    The LLM context was already built upstream from the full doc list, so
+    this only affects presentation. The single consolidated source
+    aggregates:
+      - unique course_code / course_title / department / level / lecturer
+      - EVERY unique heading & subheading (rendered as bullets)
+      - EVERY unique page number (sorted ascending, comma-joined)
+
+    This replaces the prior per-page dedupe, which still produced several
+    'sources' when a question spanned multiple pages/modules.
+    """
+    if not sources:
+        return []
+
+    course_codes = _unique_strs(s.course_code for s in sources)
+    course_titles = _unique_strs(
+        s.course_title or s.module_title for s in sources
+    )
+    departments = _unique_strs(s.department for s in sources)
+    levels = _unique_strs(s.level for s in sources)
+    lecturers = _unique_strs(s.lecturer_name for s in sources)
+    headings = _unique_strs(s.heading_and_subheading for s in sources)
+    pages = sorted(_unique_strs(s.page for s in sources), key=_page_sort_key)
+
+    citation: list[str] = [
+        f"- Course Code: {', '.join(course_codes) or 'N/A'}",
+        f"- Course Title: {', '.join(course_titles) or 'N/A'}",
+        f"- Department: {', '.join(departments) or 'N/A'}",
+        f"- Level: {', '.join(levels) or 'N/A'}",
+        f"- Lecturer Name: {', '.join(lecturers) or 'N/A'}",
+    ]
+    if headings:
+        citation.append("- Heading & Subheading:")
+        citation.extend(f"  - {h}" for h in headings)
+    else:
+        citation.append("- Heading & Subheading: N/A")
+    citation.append(f"- Page: {', '.join(pages) if pages else 'N/A'}")
+
+    consolidated = SourceItem(
+        course_code=", ".join(course_codes) or None,
+        course_title=", ".join(course_titles) or None,
+        department=", ".join(departments) or None,
+        level=", ".join(levels) or None,
+        lecturer_name=", ".join(lecturers) or None,
+        heading_and_subheading="; ".join(headings) or None,
+        page=", ".join(pages) or None,
+        citation=citation,
+    )
+    logger.info(
+        "Consolidated %d retrieved chunks -> 1 source "
+        "(pages=%s, headings=%d)",
+        len(sources),
+        pages,
+        len(headings),
+    )
+    return [consolidated]
+
+
+def _source_dedupe_key(item: SourceItem) -> tuple[str, str, str]:
+    """Composite key for per-page dedupe in /search."""
+    return (
+        (item.course_code or "").strip().lower(),
+        str(item.page) if item.page not in (None, "") else "",
+        (item.heading_and_subheading or "").strip().lower(),
+    )
+
+
+def _dedupe_sources(sources: list[SourceItem]) -> list[SourceItem]:
+    """Per-page dedupe used only by /search (which returns per-chunk text)."""
+    if not sources:
+        return sources
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[SourceItem] = []
+    for item in sources:
+        key = _source_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    if len(unique) != len(sources):
+        logger.info(
+            "Search dedupe: %d -> %d unique (key=course_code|page|heading)",
+            len(sources),
+            len(unique),
+        )
+    return unique
+
+
+def _format_citations_block(sources: list["SourceItem"]) -> str:
+    """Render the citation block for the answer text.
+
+    When there is exactly one source (the /ask path), render the
+    consolidated field list directly. If a caller ever passes multiple,
+    fall back to labelled [Source N] blocks.
     """
     if not sources:
         return ""
 
-    blocks: list[str] = []
-    for i, s in enumerate(sources, 1):
-        citation = s.citation or []
+    if len(sources) == 1:
+        citation = sources[0].citation or []
         if isinstance(citation, str):
             citation = [citation]
-        blocks.append(f"**[Source {i}]**\n" + "\n".join(citation))
+        body = "\n".join(citation)
+    else:
+        blocks: list[str] = []
+        for i, s in enumerate(sources, 1):
+            citation = s.citation or []
+            if isinstance(citation, str):
+                citation = [citation]
+            blocks.append(f"**[Source {i}]**\n" + "\n".join(citation))
+        body = "\n\n".join(blocks)
 
-    return "\n\n### Citations / Source Metadata\n\n" + "\n\n".join(blocks)
+    return "\n\n### Citations / Source Metadata\n\n" + body
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
@@ -225,11 +345,10 @@ def healthz():
 
 
 # ---------------------------------------------------------------------------
-# Debug endpoints — protect with API key like everything else
+# Debug endpoints
 # ---------------------------------------------------------------------------
 @app.get("/debug/schema", dependencies=[Depends(verify_api_key)])
 def debug_schema_endpoint():
-    """Return collection schema so you can confirm which property holds text."""
     try:
         return debug_schema()
     except Exception as e:
@@ -245,8 +364,6 @@ def debug_search_endpoint(
     department: str | None = Query(None),
     level: str | None = Query(None),
 ):
-    """Raw hybrid search returning ALL properties so you can verify text is
-    actually present in retrieved docs before blaming the LLM."""
     try:
         return debug_search(
             q,
@@ -273,7 +390,6 @@ def ask_question(req: AskRequest):
         )
         result = chain.invoke({"question": req.question})
     except ValueError as e:
-        # Filter referenced a property that isn't in the schema.
         logger.warning("Request rejected: %s", e)
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -289,7 +405,7 @@ def ask_question(req: AskRequest):
     external_answer = result.get("external_answer", "")
     docs = result.get("docs", []) or []
 
-    sources: list[SourceItem] = []
+    per_chunk: list[SourceItem] = []
     extracted_keywords: set[str] = set()
 
     for d in docs:
@@ -299,7 +415,6 @@ def ask_question(req: AskRequest):
             f"{heading} > {subheading}".strip(" >") if heading or subheading else None
         )
 
-        # Tolerate alternate ingestion field names for page.
         page_val = d.get("page")
         if page_val is None:
             page_val = d.get("page_num")
@@ -321,12 +436,14 @@ def ask_question(req: AskRequest):
             score=d.get("score"),
             keywords=d.get("keywords") if isinstance(d.get("keywords"), list) else [],
         )
-
         item.citation = _build_list_citation(d)
-        sources.append(item)
+        per_chunk.append(item)
 
         if isinstance(d.get("keywords"), list):
             extracted_keywords.update(d.get("keywords"))
+
+    # Collapse all retrieved chunks into a single aggregated citation.
+    sources = _consolidate_sources(per_chunk)
 
     keywords_list = list(extracted_keywords)
     keywords_formatted_block = (
@@ -336,7 +453,6 @@ def ask_question(req: AskRequest):
         else ""
     )
 
-    # Single source of truth for citations in the answer text.
     citations_block = _format_citations_block(sources)
 
     final_dual_response = (
@@ -353,8 +469,6 @@ def ask_question(req: AskRequest):
     )
 
     if req.pretty:
-        # include_sources=False — citations are rendered once via citations_block
-        # so there is no duplication and no divergence between pretty/non-pretty.
         pretty_internal = format_answer(
             internal_answer, sources, include_sources=False
         )
@@ -448,6 +562,10 @@ def search(
         )
         item.citation = _build_list_citation(h)
         results.append(item)
+
+    # /search keeps one result per page (not one grand total) because
+    # results carry per-chunk text and score meant for exploration.
+    results = _dedupe_sources(results)
 
     pretty_block = format_search_results(hits) if pretty else None
     response_meta = ResponseMetadata(
