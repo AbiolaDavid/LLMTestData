@@ -1,34 +1,48 @@
 import os
 import logging
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from openai import OpenAI  # OpenAI-compatible client for Cohere
 
 from weaviate_client import (
+    get_agent,
     search_collection,
     close_client,
-    debug_schema,
-    debug_search,
     COLLECTION_NAME,
 )
 from formatter import format_answer, format_search_results, format_source
-from langchain_pipeline import (
-    build_dual_response_chain,
-    get_llm,
-    COHERE_MODEL,
-    COHERE_BASE_URL,
-)
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Configuration (fail fast)
+# ---------------------------------------------------------------------------
 API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY environment variable is required")
 
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS") == "1"
+COHERE_API_KEY = (os.environ.get("COHERE_API_KEY") or "").strip()
+if not COHERE_API_KEY:
+    logger.warning("COHERE_API_KEY not set. External LLM expansion will be disabled.")
+
+# Cohere OpenAI-compatible endpoint & model (overridable via env vars)
+COHERE_BASE_URL = os.environ.get(
+    "COHERE_BASE_URL", "https://api.cohere.ai/compatibility/v1"
+)
+COHERE_MODEL = os.environ.get("COHERE_MODEL", "command-a-03-2025")
+
+# Initialize OpenAI-compatible client pointing at Cohere
+cohere_client = (
+    OpenAI(base_url=COHERE_BASE_URL, api_key=COHERE_API_KEY)
+    if COHERE_API_KEY
+    else None
+)
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -39,34 +53,50 @@ if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:3000", "http://localhost:8000"]
 
 
-def _llm_startup_check() -> None:
-    llm = get_llm()
-    if llm is None:
-        logger.warning("LLM disabled — external expansion will return fallback text")
+# ---------------------------------------------------------------------------
+# Cohere health check (run once at startup so failures are visible early)
+# ---------------------------------------------------------------------------
+def _cohere_startup_check() -> None:
+    """Ping Cohere once at boot so bad keys / bad model names surface immediately."""
+    global cohere_client
+    if not cohere_client:
         return
     try:
-        llm.invoke("ping")
-        logger.info(
-            "LangChain LLM OK (model=%s, base=%s)", COHERE_MODEL, COHERE_BASE_URL
+        cohere_client.chat.completions.create(
+            model=COHERE_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5,
         )
+        logger.info("Cohere (OpenAI-compat) client OK (model=%s)", COHERE_MODEL)
     except Exception as e:
-        logger.error("LLM startup check failed: %s", e, exc_info=True)
+        logger.error(
+            "Cohere startup check failed (model=%s): %s. "
+            "Disabling external expansion for this process.",
+            COHERE_MODEL,
+            e,
+            exc_info=True,
+        )
+        cohere_client = None  # disable so `if cohere_client` short-circuits
 
 
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _llm_startup_check()
+    # Startup: verify Cohere is reachable, Weaviate client is lazy-initialized.
+    _cohere_startup_check()
     yield
+    # Shutdown: close the Weaviate client cleanly.
     close_client()
 
 
+# ---------------------------------------------------------------------------
+# App & middleware
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Federal University of Lafia (FULafia) AI RAG API",
-    description=(
-        "Welcome to Federal University of Lafia (FULafia) AI RAG API. "
-        "LangChain-orchestrated dual-response pipeline combining internal "
-        "Weaviate retrieval with external Cohere expansion."
-    ),
+    title="FULafia RAG API",
+    description="Welcome to FULafia's RAG API. Combining internal knowledge base search with external LLM expansion.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -78,6 +108,9 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
 async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     if x_api_key != API_KEY:
         raise HTTPException(
@@ -87,54 +120,36 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     return x_api_key
 
 
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(
-        ..., min_length=1, max_length=5000, description="Natural-language question"
+        ...,
+        min_length=1,
+        max_length=5000,
+        description="Natural-language question",
     )
     pretty: bool = Field(True, description="Return a human-readable formatted answer")
     department: str | None = Field(None, description="User department context")
-    level: str | None = Field(
-        None, description="User level context (e.g. 100, 200, 300)"
-    )
-    min_score: float | None = Field(
-        None,
-        ge=0.0,
-        description="Optional minimum hybrid score; below this hits are dropped",
-    )
+    level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
 
 
 class SourceItem(BaseModel):
     text: str | None = None
     source: str | None = None
-    course_code: str | None = None
-    course_title: str | None = None
     module_title: str | None = None
-    lecturer_name: str | None = None
-    department: str | None = None
-    level: str | None = None
     heading: str | None = None
-    subheading: str | None = None
-    heading_and_subheading: str | None = None
-    page: int | str | None = None
+    page: int | None = None
     chunk_id: str | None = None
     score: float | None = None
-    keywords: list[str] | None = None
-    citation: str | list[str] | None = None
-
-
-class ResponseMetadata(BaseModel):
-    department: str | None = Field(None, description="User department context")
-    level: str | None = Field(
-        None, description="User level context (e.g. 100, 200, 300)"
-    )
+    citation: str | None = None
 
 
 class AskResponse(BaseModel):
     answer: str
     answer_pretty: str | None = None
     sources: list[SourceItem]
-    keywords_for_further_reading: list[str] = Field(default_factory=list)
-    metadata: ResponseMetadata | None = None
 
 
 class SearchResponse(BaseModel):
@@ -142,356 +157,181 @@ class SearchResponse(BaseModel):
     collection: str
     results: list[SourceItem]
     results_pretty: str | None = None
-    metadata: ResponseMetadata | None = None
-
-
-def _error_detail(exc: Exception, default: str) -> str:
-    if DEBUG_ERRORS:
-        return f"{type(exc).__name__}: {exc}"
-    return default
 
 
 # ---------------------------------------------------------------------------
-# Citation building
+# Helpers
 # ---------------------------------------------------------------------------
-def _build_list_citation(doc: dict) -> list[str]:
-    """Build a per-chunk citation list (used as the source of truth that
-    the /search endpoint returns per result)."""
-    heading = doc.get("heading") or ""
-    subheading = doc.get("subheading") or ""
-    heading_and_subheading = (
-        f"{heading} > {subheading}".strip(" >")
-        if heading or subheading
-        else (doc.get("heading_and_subheading") or "N/A")
-    )
-
-    page = doc.get("page")
-    if page is None:
-        page = doc.get("page_num")
-    page_display = page if page not in (None, "") else "N/A"
-
-    return [
-        f"- Course Code: {doc.get('course_code') or 'N/A'}",
-        f"- Course Title: {doc.get('course_title') or doc.get('module_title') or 'N/A'}",
-        f"- Department: {doc.get('department') or 'N/A'}",
-        f"- Level: {doc.get('level') or 'N/A'}",
-        f"- Lecturer Name: {doc.get('lecturer_name') or 'N/A'}",
-        f"- Heading & Subheading: {heading_and_subheading}",
-        f"- Page: {page_display}",
-    ]
-
-
-def _unique_strs(values) -> list[str]:
-    """Ordered unique list of non-empty stripped strings."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for v in values:
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-def _page_sort_key(p: str):
+def _extract_openai_text(response) -> str:
+    """Robustly pull text out of an OpenAI-style chat completion response."""
     try:
-        return (0, int(p))
-    except (TypeError, ValueError):
-        return (1, p)
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            content = getattr(choices[0].message, "content", None)
+            if content:
+                return content.strip()
+    except Exception:
+        logger.error("Unexpected Cohere response shape: %r", response, exc_info=True)
+    return "External source returned no content."
 
 
-def _consolidate_sources(sources: list["SourceItem"]) -> list["SourceItem"]:
-    """Collapse all retrieved chunks into ONE consolidated source entry.
+def _call_cohere_external(
+    question: str,
+    internal_answer: str,
+    is_internal_empty: bool,
+    department: str | None = None,
+    level: str | None = None,
+) -> str:
+    """Call Cohere via OpenAI-compatible endpoint with optional student context."""
+    if not cohere_client:
+        return "External expansion temporarily unavailable."
 
-    The LLM context was already built upstream from the full doc list, so
-    this only affects presentation. The single consolidated source
-    aggregates:
-      - unique course_code / course_title / department / level / lecturer
-      - EVERY unique heading & subheading (rendered as bullets)
-      - EVERY unique page number (sorted ascending, comma-joined)
+    context_details = []
+    if department:
+        context_details.append(f"Department: {department}")
+    if level:
+        context_details.append(f"Level: {level}")
+    
+    user_context = f" [Student Info: {', '.join(context_details)}]" if context_details else ""
 
-    This replaces the prior per-page dedupe, which still produced several
-    'sources' when a question spanned multiple pages/modules.
-    """
-    if not sources:
-        return []
-
-    course_codes = _unique_strs(s.course_code for s in sources)
-    course_titles = _unique_strs(
-        s.course_title or s.module_title for s in sources
-    )
-    departments = _unique_strs(s.department for s in sources)
-    levels = _unique_strs(s.level for s in sources)
-    lecturers = _unique_strs(s.lecturer_name for s in sources)
-    headings = _unique_strs(s.heading_and_subheading for s in sources)
-    pages = sorted(_unique_strs(s.page for s in sources), key=_page_sort_key)
-
-    citation: list[str] = [
-        f"- Course Code: {', '.join(course_codes) or 'N/A'}",
-        f"- Course Title: {', '.join(course_titles) or 'N/A'}",
-        f"- Department: {', '.join(departments) or 'N/A'}",
-        f"- Level: {', '.join(levels) or 'N/A'}",
-        f"- Lecturer Name: {', '.join(lecturers) or 'N/A'}",
-    ]
-    if headings:
-        citation.append("- Heading & Subheading:")
-        citation.extend(f"  - {h}" for h in headings)
-    else:
-        citation.append("- Heading & Subheading: N/A")
-    citation.append(f"- Page: {', '.join(pages) if pages else 'N/A'}")
-
-    consolidated = SourceItem(
-        course_code=", ".join(course_codes) or None,
-        course_title=", ".join(course_titles) or None,
-        department=", ".join(departments) or None,
-        level=", ".join(levels) or None,
-        lecturer_name=", ".join(lecturers) or None,
-        heading_and_subheading="; ".join(headings) or None,
-        page=", ".join(pages) or None,
-        citation=citation,
-    )
-    logger.info(
-        "Consolidated %d retrieved chunks -> 1 source "
-        "(pages=%s, headings=%d)",
-        len(sources),
-        pages,
-        len(headings),
-    )
-    return [consolidated]
-
-
-def _source_dedupe_key(item: SourceItem) -> tuple[str, str, str]:
-    """Composite key for per-page dedupe in /search."""
-    return (
-        (item.course_code or "").strip().lower(),
-        str(item.page) if item.page not in (None, "") else "",
-        (item.heading_and_subheading or "").strip().lower(),
-    )
-
-
-def _dedupe_sources(sources: list[SourceItem]) -> list[SourceItem]:
-    """Per-page dedupe used only by /search (which returns per-chunk text)."""
-    if not sources:
-        return sources
-    seen: set[tuple[str, str, str]] = set()
-    unique: list[SourceItem] = []
-    for item in sources:
-        key = _source_dedupe_key(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    if len(unique) != len(sources):
-        logger.info(
-            "Search dedupe: %d -> %d unique (key=course_code|page|heading)",
-            len(sources),
-            len(unique),
+    if is_internal_empty:
+        system_prompt = (
+           f"You are an expert academic assistant and pedagogical coach.{user_context} "
+    "The internal knowledge base could not find a relevant answer to the user's question. "
+    "Your task is to provide a comprehensive, accurate, and well-structured response "
+    "drawn solely from your pre-trained knowledge.\n\n"
+    "Core guidelines:\n"
+    "1. Tailor depth, vocabulary, examples, and complexity precisely to the student's academic level and field of study.\n"
+    "2. Structure the answer clearly (e.g., definition → explanation → examples → implications/common pitfalls → summary).\n"
+    "3. Use precise academic language while remaining accessible; include concrete examples, analogies, or step-by-step reasoning where helpful.\n"
+    "4. Explicitly note any limitations, uncertainties, or areas where knowledge may be incomplete or contested.\n"
+    "5. Promote deeper learning: briefly highlight key concepts, common misconceptions, and suggest related questions or further exploration when appropriate.\n"
+    "6. Maintain a professional, supportive, and neutral academic tone. Avoid unnecessary greetings, flattery, or filler."
         )
-    return unique
-
-
-def _format_citations_block(sources: list["SourceItem"]) -> str:
-    """Render the citation block for the answer text.
-
-    When there is exactly one source (the /ask path), render the
-    consolidated field list directly. If a caller ever passes multiple,
-    fall back to labelled [Source N] blocks.
-    """
-    if not sources:
-        return ""
-
-    if len(sources) == 1:
-        citation = sources[0].citation or []
-        if isinstance(citation, str):
-            citation = [citation]
-        body = "\n".join(citation)
+        user_prompt = f"Original Question: {question}"
     else:
-        blocks: list[str] = []
-        for i, s in enumerate(sources, 1):
-            citation = s.citation or []
-            if isinstance(citation, str):
-                citation = [citation]
-            blocks.append(f"**[Source {i}]**\n" + "\n".join(citation))
-        body = "\n\n".join(blocks)
+        system_prompt = (
+            f"You are an expert academic supplement and pedagogical coach.{user_context} "
+    "A user asked a question and an internal knowledge base has already provided a grounded, primary answer. "
+    "Your sole task is to deliver a related, broader, complementary, or deeper perspective that adds genuine new value "
+    "suited to the student's level and field of study.\n\n"
+    "CRITICAL RULES (strictly enforce):\n"
+    "1. Scan the internal answer for any greetings, pleasantries, or opening/closing formalities and never repeat them.\n"
+    "2. DO NOT contradict, rephrase, summarize, or restate any part of the internal answer.\n"
+    "3. DO NOT repeat or closely paraphrase the internal answer's content, explanations, examples, or conclusions.\n"
+    "4. DO NOT cite, reference, or allude to internal sources, the knowledge base, or the existence of a prior answer.\n"
+    "5. Provide only new, additive value: alternative angles, broader context, real-world applications, historical/theoretical connections, "
+    "common pitfalls, advanced nuances, cross-disciplinary links, study strategies, or further questions for reflection.\n"
+    "6. Match the student's academic level and field in tone, terminology, and depth.\n"
+    "7. Keep the response focused, well-structured, and concise while remaining academically rigorous.\n"
+    
+        )
+        user_prompt = (
+            f"Original Question: {question}\n\n"
+            f"Internal Knowledge Base Answer: {internal_answer}"
+        )
 
-    return "\n\n### Citations / Source Metadata\n\n" + body
+    try:
+        response = cohere_client.chat.completions.create(
+            model=COHERE_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return _extract_openai_text(response)
+    except Exception as e:
+        logger.error("External LLM (Cohere) error: %s", e, exc_info=True)
+        return "External expansion temporarily unavailable."
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "service": "Federal University of Lafia (FULafia) AI RAG API System",
-        "orchestrator": "langchain",
-    }
+    return {"status": "ok", "service": "Fulafia AI RAG API"}
 
 
 @app.get("/healthz")
 def healthz():
-    llm = get_llm()
     return {
         "status": "ok",
         "collection": COLLECTION_NAME,
-        "orchestrator": "langchain",
-        "llm_enabled": llm is not None,
-        "llm_model": COHERE_MODEL if llm else None,
-        "llm_base_url": COHERE_BASE_URL if llm else None,
+        "cohere_enabled": cohere_client is not None,
+        "cohere_model": COHERE_MODEL if cohere_client else None,
+        "cohere_base_url": COHERE_BASE_URL if cohere_client else None,
     }
 
 
-# ---------------------------------------------------------------------------
-# Debug endpoints
-# ---------------------------------------------------------------------------
-@app.get("/debug/schema", dependencies=[Depends(verify_api_key)])
-def debug_schema_endpoint():
-    try:
-        return debug_schema()
-    except Exception as e:
-        logger.error("Schema debug error: %s", e, exc_info=True)
-        raise HTTPException(500, _error_detail(e, "Unable to read schema"))
-
-
-@app.get("/debug/search", dependencies=[Depends(verify_api_key)])
-def debug_search_endpoint(
-    q: str = Query(..., min_length=1),
-    limit: int = Query(3, ge=1, le=20),
-    alpha: float = Query(0.5, ge=0.0, le=1.0),
-    department: str | None = Query(None),
-    level: str | None = Query(None),
-):
-    try:
-        return debug_search(
-            q,
-            limit=limit,
-            alpha=alpha,
-            department=department,
-            level=level,
-        )
-    except Exception as e:
-        logger.error("Search debug error: %s", e, exc_info=True)
-        raise HTTPException(500, _error_detail(e, "Unable to run debug search"))
-
-
-# ---------------------------------------------------------------------------
-# Main endpoints
-# ---------------------------------------------------------------------------
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
 def ask_question(req: AskRequest):
+    """
+    RAG endpoint:
+    1. QueryAgent searches TestingData (Internal) filtered/guided by department and level context.
+    2. Cohere expands on the answer using contextualized general knowledge (External).
+    3. Responses are aggregated and returned.
+    """
+    # --- STEP 1: Execute Internal Weaviate Query ---
     try:
-        chain = build_dual_response_chain(
-            department=req.department,
-            level=req.level,
-            min_score=req.min_score,
-        )
-        result = chain.invoke({"question": req.question})
-    except ValueError as e:
-        logger.warning("Request rejected: %s", e)
-        raise HTTPException(400, str(e))
+        agent = get_agent(department=req.department, level=req.level)
+        result = agent.ask(req.question)
     except Exception as e:
-        logger.error("Chain invocation error: %s", e, exc_info=True)
+        logger.error(f"Agent error: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=_error_detail(
-                e, "An internal error occurred while generating the answer."
-            ),
+            detail="An internal error occurred while generating the answer.",
         )
 
-    internal_answer = result.get("internal_answer", "")
-    external_answer = result.get("external_answer", "")
-    docs = result.get("docs", []) or []
-
-    per_chunk: list[SourceItem] = []
-    extracted_keywords: set[str] = set()
-
-    for d in docs:
-        heading = d.get("heading") or ""
-        subheading = d.get("subheading") or ""
-        combined_heading = (
-            f"{heading} > {subheading}".strip(" >") if heading or subheading else None
-        )
-
-        page_val = d.get("page")
-        if page_val is None:
-            page_val = d.get("page_num")
-
+    sources: list[SourceItem] = []
+    for s in getattr(result, "sources", []) or []:
+        props = getattr(s, "properties", None) or {}
         item = SourceItem(
-            text=d.get("text"),
-            source=d.get("source"),
-            course_code=d.get("course_code"),
-            course_title=d.get("course_title"),
-            module_title=d.get("module_title"),
-            lecturer_name=d.get("lecturer_name"),
-            department=d.get("department"),
-            level=d.get("level"),
-            heading=heading or None,
-            subheading=subheading or None,
-            heading_and_subheading=combined_heading,
-            page=page_val,
-            chunk_id=d.get("chunk_id"),
-            score=d.get("score"),
-            keywords=d.get("keywords") if isinstance(d.get("keywords"), list) else [],
+            text=props.get("text"),
+            source=props.get("source"),
+            module_title=props.get("module_title"),
+            heading=props.get("heading"),
+            page=props.get("page"),
+            chunk_id=props.get("chunk_id"),
         )
-        item.citation = _build_list_citation(d)
-        per_chunk.append(item)
+        item.citation = format_source(item.model_dump())
+        sources.append(item)
 
-        if isinstance(d.get("keywords"), list):
-            extracted_keywords.update(d.get("keywords"))
+    internal_answer = getattr(result, "final_answer", None) or str(result)
+    is_internal_empty = "not in the provided materials" in internal_answer.lower()
 
-    # Collapse all retrieved chunks into a single aggregated citation.
-    sources = _consolidate_sources(per_chunk)
-
-    keywords_list = list(extracted_keywords)
-    keywords_formatted_block = (
-        "\n\n### Keywords for Further Reading\n"
-        + "\n".join(f"- {kw}" for kw in keywords_list)
-        if keywords_list
-        else ""
-    )
-
-    citations_block = _format_citations_block(sources)
-
-    final_dual_response = (
-        f"**Internal Response:**\n{internal_answer}"
-        f"{citations_block}\n\n"
-        f"---\n\n"
-        f"**External Source:**\n{external_answer}"
-        f"{keywords_formatted_block}"
-    )
-
-    response_meta = ResponseMetadata(
+    # --- STEP 2: Generate External Response via Cohere ---
+    external_answer = _call_cohere_external(
+        question=req.question,
+        internal_answer=internal_answer,
+        is_internal_empty=is_internal_empty,
         department=req.department,
         level=req.level,
     )
 
+    # --- STEP 3: Aggregation ---
+    final_dual_response = (
+        f"**Internal Response:**\n{internal_answer}\n\n"
+        f"---\n\n"
+        f"**External Source:**\n{external_answer}"
+    )
+
     if req.pretty:
-        pretty_internal = format_answer(
-            internal_answer, sources, include_sources=False
-        )
+        pretty_internal = format_answer(internal_answer, sources, include_sources=True)
         pretty_dual_response = (
-            f"{pretty_internal}"
-            f"{citations_block}\n\n"
+            f"{pretty_internal}\n\n"
             f"---\n\n"
             f"**External Source:**\n{external_answer}"
-            f"{keywords_formatted_block}"
         )
         return AskResponse(
             answer=final_dual_response,
             answer_pretty=pretty_dual_response,
             sources=sources,
-            keywords_for_further_reading=keywords_list,
-            metadata=response_meta,
         )
 
     return AskResponse(
         answer=final_dual_response,
         sources=sources,
-        keywords_for_further_reading=keywords_list,
-        metadata=response_meta,
     )
 
 
@@ -500,82 +340,43 @@ def search(
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     limit: int = Query(8, ge=1, le=30, description="Max number of chunks to return"),
     alpha: float = Query(
-        0.5,
+        0.7,
         ge=0.0,
         le=1.0,
         description="Hybrid search balance (0=BM25 only, 1=vector only)",
     ),
     department: str | None = Query(None, description="Department metadata filter"),
     level: str | None = Query(None, description="Level metadata filter"),
-    min_score: float | None = Query(
-        None, ge=0.0, description="Drop hits with a hybrid score below this value"
-    ),
     pretty: bool = Query(True, description="Also return a human-readable block"),
 ):
+    """Direct hybrid search against the TestingData collection with optional filters."""
     try:
-        hits = search_collection(
-            q,
-            limit=limit,
-            alpha=alpha,
-            department=department,
-            level=level,
-            min_score=min_score,
-        )
-    except ValueError as e:
-        logger.warning("Search request rejected: %s", e)
-        raise HTTPException(400, str(e))
+        hits = search_collection(q, limit=limit, alpha=alpha, department=department, level=level)
     except Exception as e:
-        logger.error("Search error: %s", e, exc_info=True)
+        logger.error(f"Search error: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=_error_detail(e, "An internal error occurred while searching."),
+            detail="An internal error occurred while searching.",
         )
 
     results: list[SourceItem] = []
     for h in hits:
-        heading = h.get("heading") or ""
-        subheading = h.get("subheading") or ""
-        combined_heading = (
-            f"{heading} > {subheading}".strip(" >") if heading or subheading else None
-        )
-
-        page_val = h.get("page")
-        if page_val is None:
-            page_val = h.get("page_num")
-
         item = SourceItem(
             text=h.get("text"),
             source=h.get("source"),
-            course_code=h.get("course_code"),
-            course_title=h.get("course_title"),
             module_title=h.get("module_title"),
-            lecturer_name=h.get("lecturer_name"),
-            department=h.get("department"),
-            level=h.get("level"),
-            heading=heading or None,
-            subheading=subheading or None,
-            heading_and_subheading=combined_heading,
-            page=page_val,
+            heading=h.get("heading"),
+            page=h.get("page"),
             chunk_id=h.get("chunk_id"),
             score=h.get("score"),
-            keywords=h.get("keywords") if isinstance(h.get("keywords"), list) else [],
         )
-        item.citation = _build_list_citation(h)
+        item.citation = format_source(item.model_dump())
         results.append(item)
 
-    # /search keeps one result per page (not one grand total) because
-    # results carry per-chunk text and score meant for exploration.
-    results = _dedupe_sources(results)
-
     pretty_block = format_search_results(hits) if pretty else None
-    response_meta = ResponseMetadata(
-        department=department,
-        level=level,
-    )
     return SearchResponse(
         query=q,
         collection=COLLECTION_NAME,
         results=results,
         results_pretty=pretty_block,
-        metadata=response_meta,
     )
