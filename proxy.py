@@ -63,8 +63,8 @@ app.add_middleware(
 # Models
 # ---------------------------------------------------------------------------
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=5000, description="Natural-language question")
-    pretty: bool = Field(True, description="Return a human-readable formatted answer")
+    question: str = Field(..., min_length=1, max_length=2000)
+    pretty: bool = False
     department: str | None = Field(None, description="User department context")
     level: str | None = Field(None, description="User level context (e.g. 100, 200, 300)")
 
@@ -84,7 +84,7 @@ def healthz():
 
 @app.post("/api/ask")
 async def proxy_ask(req: AskRequest, request: Request):
-    """Forward the question to the upstream Render API with the secret key and metadata options."""
+    """Forward the question to the upstream Render API with the secret key."""
     url = f"{UPSTREAM_URL}/ask"
     headers = {
         "Content-Type": "application/json",
@@ -107,6 +107,7 @@ async def proxy_ask(req: AskRequest, request: Request):
         raise HTTPException(502, "Cannot reach upstream service")
 
     if r.status_code >= 400:
+        # Pass through the upstream error shape where possible
         try:
             detail = r.json().get("detail", r.text)
         except Exception:
